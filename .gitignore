@@ -16,3 +16,25 @@ wechat_media/
 .pytest_cache/
 *_keys.json
 voice_cache.json
+
+
+# ── wechat-corpus-toolkit 运行时产物(任何真实数据不入库) ──
+key_windows.txt
+key.txt
+all_keys.json
+contacts.json
+identities.json
+decrypted/
+wxlocal/exports21/
+wxlocal/wxbase.db*
+wxlocal/groups.json
+wxlocal/dms.json
+wxlocal/reports/
+wxlocal/overview.html
+wxlocal/circle_map.png
+wxlocal/.key_*
+wxlocal/.task_*
+wxlocal/.detach_*
+*.json.prev
+.venv/
+__pycache__/

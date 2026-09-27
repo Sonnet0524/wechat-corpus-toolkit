@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微信语料数据结构说明（wechat-decrypt / wxlocal）</title><style>
+:root{--bg:#f6f7f9;--panel:#fff;--line:#e6e8ec;--ink:#1b1f24;--ink2:#5b6472;--ink3:#8c95a3;
+--accent:#1a56c4;--shadow:0 1px 2px rgba(16,24,40,.06),0 6px 20px rgba(16,24,40,.05)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.75 "PingFang SC","Microsoft YaHei","Segoe UI",Roboto,system-ui,sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:30px 22px 70px}
+.doc{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+padding:30px 34px 40px;box-shadow:var(--shadow)}
+h1{font-size:25px;margin:0 0 6px;letter-spacing:.2px}
+h1+blockquote{margin-top:10px}
+.meta{color:var(--ink3);font-size:12.5px;margin:0 0 22px;
+padding-bottom:14px;border-bottom:1px solid var(--line)}
+h2{font-size:19px;margin:38px 0 12px;padding-top:14px;border-top:1px solid var(--line)}
+h3{font-size:16.5px;margin:26px 0 10px;color:#14315f}
+h4{font-size:14.5px;margin:20px 0 8px;color:var(--ink2)}
+p{margin:9px 0}
+ul,ol{margin:9px 0;padding-left:22px}
+li{margin:4px 0}
+hr{border:0;border-top:1px solid var(--line);margin:26px 0}
+blockquote{margin:12px 0;padding:10px 14px;background:#f2f6fd;border-left:3px solid #9db8ea;
+border-radius:0 8px 8px 0;color:#2c3a52;font-size:14px}
+blockquote p{margin:4px 0}
+code{background:#eef1f5;padding:1.5px 5px;border-radius:5px;font-size:12.5px;
+font-family:ui-monospace,Consolas,"Courier New",monospace;color:#0b4f6c;word-break:break-all}
+strong{font-weight:680;color:#0f2f66}
+a{color:var(--accent);text-decoration:none;border-bottom:1px solid #c3d4f2}
+a:hover{border-bottom-color:var(--accent)}
+.tw{overflow-x:auto;margin:14px 0}
+table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:520px}
+th,td{padding:8px 11px;border-bottom:1px solid #eef1f5;text-align:left;vertical-align:top}
+thead th{background:#fbfcfd;font-size:12.5px;color:var(--ink2);font-weight:600;
+white-space:nowrap;border-bottom:1px solid var(--line)}
+tbody tr:hover{background:#fafbfd}
+tbody td:first-child{font-weight:600;color:#14315f}
+.foot{color:var(--ink3);font-size:12px;margin-top:18px;text-align:right}
+@media(max-width:640px){.doc{padding:20px 16px 28px}.wrap{padding:16px 10px 40px}}
+</style></head>
+<body><div class="wrap"><div class="doc">
+<h1>微信语料数据结构说明（wechat-decrypt / wxlocal）</h1>
+<blockquote><p>版本：v1.0 ｜ 2026-09-26 ｜ 范围：<strong>数据准备链路</strong>（加密库 → 提 key → 解密 → 导出 → 建库）</p><p>性质：全部字段与规模均<strong>实测</strong>（<code>wxbase.db</code> 2026-09-26 全量历史态）；口径与坑逐条标注证据。</p><p>配套：流程手册见 skill <code>wechat-data-prep/SKILL.md</code>；导出格式原始规范见 <code>docs/wxexport_v2_spec.md</code>；</p><p>融合设计见 <code>docs/fusion-analysis.md</code>。</p></blockquote>
+<hr>
+<h2>0. 三层数据总览</h2>
+<p>```</p>
+<p>L0 原始加密库            ①提key        ②解密              ④导出              ⑤建库</p>
+<p>~/Documents/xwechat_     ────&gt;      decrypted/       ────&gt;  exports21/      ────&gt;  wxlocal/</p>
+<p>files/*/db_storage/                 &lt;account&gt;/               wx_*.json              wxbase.db</p>
+<p>(SQLCipher v4 加密)                 db_storage/             cards.json             (六表, 明文)</p>
+<p>(明文镜像)              membership.json</p>
+<p>manifest21.json</p>
+<p>L0                        →         L1（wxexport/2.1）        →            L2（wxbase.db）</p>
+<p>```</p>
+<div class="tw"><table><thead><tr><th>层</th><th>载体</th><th>性质</th><th>规模（2026-09-26 全量历史）</th></tr></thead><tbody>
+<tr><td><strong>L0</strong></td><td>微信加密库 <code>db_storage/**/*.db</code></td><td>SQLCipher v4 密文，随微信运行变化</td><td>message/contact/contact_fts 等 22 个库</td></tr>
+<tr><td><strong>L1</strong></td><td><code>wxlocal/exports21/</code></td><td>明文 JSON（wxexport/2.1），<strong>脱敏友好</strong>（PII 只在一处花名册）</td><td>每会话一文件 + <code>cards/membership/manifest</code></td></tr>
+<tr><td><strong>L2</strong></td><td><code>wxlocal/wxbase.db</code></td><td>SQLite 六表，分析直接消费</td><td>见 §3</td></tr>
+</tbody></table></div>
+<p><strong>三层各自回答什么</strong>：L0 = 微信真实状态（权威但加密、结构复杂）；L1 = 可移植的中间语料</p>
+<p>（跨机交换、云端入库的接口）；L2 = 本机分析库（索引化、口径统一、含派生列）。</p>
+<hr>
+<h2>1. L0 —— 原始加密库（微信 4.x）</h2>
+<h3>1.1 位置与文件布局</h3>
+<p>```</p>
+<p>~/Documents/xwechat_files/</p>
+<p>└── {wxid}_{device}/                    # account，如 wxid_example_main_xxx</p>
+<p>└── db_storage/</p>
+<p>├── message/</p>
+<p>│   ├── message_0.db            # 消息库（分库；&gt;N 条后分裂 message_1.db…）</p>
+<p>│   ├── message_1.db</p>
+<p>│   └── ...</p>
+<p>├── contact/</p>
+<p>│   ├── contact.db              # 联系人</p>
+<p>│   └── contact_fts.db          # 全文/群名片（含 chatroom_member_fts_v3）</p>
+<p>└── ...                         # session/media/其他</p>
+<p>```</p>
+<ul>
+<li>- <code>account = {wxid}_{device}</code>；多账号时取 <strong>mtime 最新</strong>的一份（<code>decrypt_all.py</code> 逻辑）。</li>
+<li>- 每个 <code>.db</code> 附带 <code>-shm</code> / <code>-wal</code>（WAL 模式）；镜像需连同主库一起解出逻辑内容。</li>
+</ul>
+<h3>1.2 加密格式（SQLCipher v4）</h3>
+<div class="tw"><table><thead><tr><th>参数</th><th>值</th></tr></thead><tbody>
+<tr><td>页大小 PAGE</td><td>4096</td></tr>
+<tr><td>保留区 RESERVE</td><td>80（页尾）</td></tr>
+<tr><td>盐 SALT</td><td>16 字节（<strong>文件头前 16 字节</strong>）</td></tr>
+<tr><td>KDF</td><td><code>PBKDF2-HMAC-SHA512(raw_key, salt, 256000, 32)</code></td></tr>
+<tr><td>分组</td><td>AES-256-CBC，每页独立 IV</td></tr>
+</tbody></table></div>
+<p><strong>页结构</strong>：<code>[0:16] 盐</code> + <code>[16:4016] 密文</code> + <code>[4016:4032] IV</code> + <code>[4032:4096] 保留</code>。</p>
+<ul>
+<li>- 第 1 页解密后，<strong>替换文件头前 16 字节为 <code>SQLite format 3\0</code></strong>（盐在明文库里让位给标准头）。</li>
+<li>- <strong>页头校验</strong>（key 正确性判据）：解密第 1 页 → <code>pt[0]==0x10, pt[1]==0x00, pt[4]==0x50, pt[5]==0x40, pt[7]==0x20</code>。</li>
+</ul>
+<p>全链路三处复用：<code>extract_raw_key.verify_candidate</code> / <code>decrypt_all.decrypt_db</code> / <code>bootstrap.verify_key</code>。</p>
+<h3>1.3 关键表与字段（明文后）</h3>
+<div class="tw"><table><thead><tr><th>表</th><th>关键列</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>Msg_&lt;md5&gt;</code></td><td><code>create_time</code> <code>local_type</code> <code>real_sender_id</code> <code>sort_seq</code> <code>server_id</code> <code>message_content</code> <code>source</code></td><td>每会话一张消息表，表名 = <code>Msg_</code> + 会话 wxid 的 md5</td></tr>
+<tr><td><code>Name2Id</code></td><td><code>rowid</code> → <code>user_name</code></td><td><strong>发送者链的枢纽</strong>；每个 message_N.db <strong>各有一份</strong></td></tr>
+<tr><td><code>contact</code></td><td><code>id</code> <code>username</code> <code>nick_name</code> <code>remark</code> <code>alias</code></td><td>昵称优先级 <code>remark &gt; nick_name &gt; alias</code></td></tr>
+<tr><td><code>stranger</code></td><td><code>username</code> <code>nick_name</code> <code>remark</code></td><td>非好友兜底</td></tr>
+<tr><td><code>chat_room</code></td><td><code>id</code> <code>username</code> <code>ext_buffer</code></td><td><code>ext_buffer</code> = 群名片 PB（wxid→名片→邀请人）</td></tr>
+<tr><td><code>chatroom_member</code></td><td><code>room_id</code> <code>member_id</code></td><td><strong>真实在群成员</strong>（含从未发言者）；id 指向 <code>contact.id</code></td></tr>
+<tr><td><code>chatroom_member_fts_v3</code>（在 contact_fts.db）</td><td><code>room_id</code> <code>member_id</code> <code>a_group_remark</code></td><td><strong>群昵称</strong>来源；其 id 是<strong>该库 name2id 的 rowid</strong>，须转 wxid 再关联</td></tr>
+</tbody></table></div>
+<p><strong>消息列语义</strong>：</p>
+<div class="tw"><table><thead><tr><th>列</th><th>类型</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>create_time</code></td><td>int</td><td><strong>秒级</strong> unix 时间戳（同秒多条靠 <code>sort_seq</code> 区分）</td></tr>
+<tr><td><code>sort_seq</code></td><td>int</td><td>同秒内单调递增排序键（3.3% 相邻消息同秒，此列保真）</td></tr>
+<tr><td><code>server_id</code></td><td>int</td><td>服务端消息 id（<strong>引用 join 的键</strong>，<code>q.svrid</code> 回链它）</td></tr>
+<tr><td><code>real_sender_id</code></td><td>int</td><td>指向<strong>本库</strong> <code>Name2Id.rowid</code>（≠ <code>contact.id</code>）</td></tr>
+<tr><td><code>local_type</code></td><td>int</td><td>类型（打包，见 §1.4）</td></tr>
+<tr><td><code>message_content</code></td><td>blob</td><td>内容；部分经 <strong>zstd 压缩</strong>（magic <code>28 b5 2f fd</code>）</td></tr>
+<tr><td><code>source</code></td><td>text</td><td>XML，含 <code>&lt;atuserlist&gt;wxid,…&lt;/atuserlist&gt;</code>（<strong>精确 @</strong>）</td></tr>
+</tbody></table></div>
+<h3>1.4 <code>local_type</code> 打包公式</h3>
+<p>```</p>
+<p>local_type = (subtype &lt;&lt; 32) | base_type</p>
+<p>文本     = 1</p>
+<p>引用消息 = (57 &lt;&lt; 32) | 49 = 244813135921</p>
+<p>链接分享 = ( 5 &lt;&lt; 32) | 49 = 21474836529</p>
+<p>```</p>
+<p><strong>过滤必须取模</strong>：<code>WHERE local_type % 4294967296 = 49</code>（直接 <code>= 49</code> <strong>零命中</strong>）。</p>
+<h3>1.5 发送者链（已证伪的旧假设 vs 正确链）</h3>
+<p>```</p>
+<p>✗ 旧假设: real_sender_id → contact.id          → 已证伪(大群抽样分库核对, 零命中)</p>
+<p>✓ 正确链: real_sender_id → 所在库 message_N.db 自己的 Name2Id.rowid → wxid</p>
+<p>→ contact(remark&gt;nick&gt;alias, 含非好友) / stranger 兜底</p>
+<p>→ wxid == db.get_my_wxid() ? "me" : 对方</p>
+<p>```</p>
+<blockquote><p><strong>msg0 / msg1 两库 Name2Id 编号各自独立</strong>（同一 wxid 在两库 rowid 不同）——必须<strong>分库解析</strong>，勿跨库套用。</p></blockquote>
+<hr>
+<h2>2. L1 —— 导出层：wxexport/2.1</h2>
+<p>每会话一个 <code>exports21/wx_&lt;slug&gt;.json</code>；另有三份<strong>跨会话汇总</strong>（cards/membership/manifest）。</p>
+<p>相对 wxexport/2 新增 5 个结构化字段（依据 <code>docs/fusion-analysis.md</code>），<strong>全部可选、向后兼容</strong>。</p>
+<h3>2.1 文件族</h3>
+<div class="tw"><table><thead><tr><th>文件</th><th>粒度</th><th>内容</th></tr></thead><tbody>
+<tr><td><code>wx_&lt;slug&gt;.json</code></td><td>每会话</td><td>该会话的 meta + chats（participants + messages）</td></tr>
+<tr><td><code>cards.json</code></td><td>跨会话</td><td><code>{slug: {room, kind, display, cards:{wxid: 群名片}}}</code></td></tr>
+<tr><td><code>membership.json</code></td><td>跨会话</td><td><code>{slug: {room, kind, display, count, members:[{wxid,name}]}}</code></td></tr>
+<tr><td><code>manifest21.json</code></td><td>跨会话</td><td>导出清单 + <code>summary</code>（按 kind 汇总，含 <code>empty</code> 标记）</td></tr>
+</tbody></table></div>
+<p><strong>slug 约定</strong>：群 <code>wx_&lt;群名净化&gt;</code>（只保留 <code>\w</code> 含 CJK）；私聊 <code>wx_dm_&lt;wxid净化&gt;</code>。</p>
+<p>库内 <code>chat_raw</code> <strong>去掉 <code>wx_</code> 前缀</strong>。群名含 emoji 必须净化；slug 撞车追加 wxid 的 md5 前缀。</p>
+<h3>2.2 <code>meta</code></h3>
+<div class="tw"><table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>schema</code></td><td>恒 <code>"wxexport/2.1"</code>（v2 为 <code>"wxexport/2"</code>）</td></tr>
+<tr><td><code>generated_at</code></td><td>导出时刻</td></tr>
+<tr><td><code>days</code> / <code>limit</code></td><td>窗口天数 / 每会话上限</td></tr>
+<tr><td><code>since</code> / <code>until</code></td><td>显式区间（unix 秒，0 = 不设）</td></tr>
+<tr><td><code>window</code></td><td>人读窗口标签；合并后为 <code>"合并 A + B"</code></td></tr>
+<tr><td><code>segments</code></td><td>（合并时）各段窗口列表</td></tr>
+<tr><td><code>chats</code> / <code>messages</code></td><td>会话数 / 总消息数</td></tr>
+<tr><td><code>fields</code></td><td>2.1 新增字段说明（<code>sq/sid/at/q/kind</code>）</td></tr>
+<tr><td><code>sender_chain</code></td><td>发送者解析链（审计用）</td></tr>
+<tr><td><code>prefix_stripped</code></td><td>本次剥离的冗余前缀条数</td></tr>
+<tr><td><code>merged_from</code></td><td>（合并时）来源文件</td></tr>
+</tbody></table></div>
+<h3>2.3 <code>chats[]</code> 与 <code>participants</code></h3>
+<p>```json</p>
+<p>"chats": [{</p>
+<p>"wxid": "12345678@chatroom",</p>
+<p>"display": "【示例群B】🌟AI×OPC×IP社群",</p>
+<p>"kind": "group",                          // 2.1 新增: group | private</p>
+<p>"count": 3,</p>
+<p>"range": ["<起>", "<止>"],</p>
+<p>"participants": {</p>
+<p>"me": {"name": "我", "wxid": "wxid_example_main", "msgs": 1},</p>
+<p>"p1": {"name": "示例用户A", "wxid": "wxid_example002…", "msgs": 2}</p>
+<p>},</p>
+<p>"messages": [ ... ]</p>
+<p>}]</p>
+<p>```</p>
+<ul>
+<li>- 键空间：<code>"me"</code> <strong>保留</strong>给账号主人（<strong>所有 me 账号归并到 <code>me</code> 键</strong>）；其余 <code>p1…pN</code> 按首次出现顺序。</li>
+<li>- <code>name</code> 优先级 <code>remark &gt; nick_name &gt; alias &gt; wxid</code>。</li>
+<li>- <strong>本机版 <code>me</code> 也带 <code>wxid</code></strong>（云端 v2 为隐私不带）；本机端到端做 join 对拍需要它。</li>
+<li>- <code>msgs</code> = 该成员发言行数（不含系统消息）。</li>
+</ul>
+<h3>2.4 <code>messages[]</code> 消息行</h3>
+<div class="tw"><table><thead><tr><th>字段</th><th>类型</th><th>2.1 新</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>t</code></td><td>int</td><td>—</td><td>unix <strong>秒</strong>，<strong>升序</strong></td></tr>
+<tr><td><code>ty</code></td><td>str</td><td>—</td><td>类型标签（文本/图片/语音/链接/撤回/加入群聊…）</td></tr>
+<tr><td><code>s</code></td><td>str</td><td>—</td><td>花名册键：<code>me</code> = 我，<code>pN</code> = 对方成员</td></tr>
+<tr><td><code>c</code></td><td>str</td><td>—</td><td>内容文本（系统消息为可读文案）；<strong>入库后保留引用全貌</strong></td></tr>
+<tr><td><code>sys</code></td><td>1</td><td>—</td><td>系统消息标记（仅真时携带，<strong>无 <code>s</code></strong>）</td></tr>
+<tr><td><code>ev</code></td><td>str</td><td>—</td><td>系统事件码（<code>pat</code>/<code>recall</code>/<code>group_join</code>…）</td></tr>
+<tr><td><code>txt</code></td><td>1</td><td>—</td><td>纯文本可读标记</td></tr>
+<tr><td><strong><code>sq</code></strong></td><td>int</td><td>✓</td><td><code>sort_seq</code>，同秒 tie-break</td></tr>
+<tr><td><strong><code>sid</code></strong></td><td>str</td><td>✓</td><td><code>server_id</code>（<strong>字符串</strong>，供 svrid join）</td></tr>
+<tr><td><strong><code>at</code></strong></td><td>str[]</td><td>✓</td><td><code>atuserlist</code> 的精确 wxid 数组（携带率 34%）</td></tr>
+<tr><td><strong><code>q</code></strong></td><td>obj</td><td>✓</td><td><code>refermsg</code> 结构化，见 §2.5</td></tr>
+</tbody></table></div>
+<h3>2.5 <code>q</code> —— 引用结构（refermsg）</h3>
+<p>```json</p>
+<p>"q": {"svrid": "1234567890123456789", "by": "示例成员", "wx": "wxid_xxx",</p>
+<p>"ref": "有结果及时通知我…", "room": "12345…@chatroom"}</p>
+<p>```</p>
+<div class="tw"><table><thead><tr><th>键</th><th>来源</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>svrid</code></td><td><code>refermsg.svrid</code></td><td><strong>join 键</strong>；→ 同库 <code>server_id</code> 命中 <strong>98.3%</strong></td></tr>
+<tr><td><code>by</code></td><td><code>displayname</code></td><td>被引者显示名</td></tr>
+<tr><td><code>wx</code></td><td><code>chatusr</code></td><td>被引者 wxid（== 真实 wxid 97%）</td></tr>
+<tr><td><code>ref</code></td><td><code>content</code></td><td>被引原文（<strong>剥前缀</strong>后截断 120 字）</td></tr>
+<tr><td><code>room</code></td><td><code>fromusr</code></td><td>被引消息所在会话 wxid</td></tr>
+</tbody></table></div>
+<blockquote><p><code>refermsg</code> 各字段出现率（微信客户端行为，与语料规模无关）：<code>type/svrid/fromusr/content</code> 100%、<code>displayname</code> 99%、<code>chatusr</code> 95%。</p></blockquote>
+<h3>2.6 汇总三文件结构</h3>
+<p>```json</p>
+<p>// cards.json</p>
+<p>{"demo_group_alpha": {"room": "…@chatroom", "kind": "group", "display": "示例群A",</p>
+<p>"cards": {"wxid_example003": "示例成员-城市-FDE"}}}</p>
+<p>// membership.json</p>
+<p>{"demo_group_alpha": {"room": "…@chatroom", "kind": "group", "display": "示例群A",</p>
+<p>"count": 429, "members": [{"wxid": "wxid_…", "name": "…"}]}}</p>
+<p>// manifest21.json</p>
+<p>{"schema": "wxexport/2.1", "days": 0, "limit": 10000000, "mode": "full",</p>
+<p>"scope": "整池", "groups_source": "groups.json:&lt;群数&gt; + dms.json:&lt;私聊数&gt;",</p>
+<p>"window": {"label": "全部历史(不限窗口)", "explicit": false, "since": 0, "until": 0},</p>
+<p>"groups": [{"slug": "demo_group_alpha", "kw": "…@chatroom", "kind": "group", "ok": true,</p>
+<p>"messages": 1398, "empty": false, "new_messages": 1398,</p>
+<p>"participants": 120, "members": 429, "cards": 88, "kb": 512,</p>
+<p>"stripped_prefix": 37, "secs": 0.4}],</p>
+<p>"summary": {"ok": &lt;会话数&gt;, "fail": 0, "empty_chats": &lt;空会话数&gt;,</p>
+<p>"total_messages": &lt;消息总数&gt;, "total_members": &lt;成员行总数&gt;,</p>
+<p>"by_kind": {"group": {...}, "private": {...}}}}</p>
+<p>```</p>
+<h3>2.7 v2 → 2.1 演进与验收清单</h3>
+<div class="tw"><table><thead><tr><th>演进</th><th>内容</th></tr></thead><tbody>
+<tr><td>字段</td><td>消息行 +<code>sq</code>/<code>sid</code>/<code>at</code>/<code>q</code>；chat +<code>kind</code>；meta +<code>since/until/window/prefix_stripped</code></td></tr>
+<tr><td>文件</td><td>新增 <code>cards.json</code>（群名片）、<code>membership.json</code>（成员全量）</td></tr>
+<tr><td>排序</td><td>SQL 显式 <code>ORDER BY create_time DESC, sort_seq DESC</code>（不再依赖隐式扫描序）</td></tr>
+<tr><td>兼容</td><td>新字段全可选 → v2 消费方（wx2corpus v3）读 2.1 行为不变</td></tr>
+</tbody></table></div>
+<p><strong>验收</strong>：<code>meta.schema</code> 分流；每文件 <code>json.load</code> 成功；<code>chats[].count == len(messages)</code>；</p>
+<p><code>t</code> 非降序；所有 <code>s</code> 都在 <code>participants</code>；<code>me</code> 键存在；脱敏只动 <code>participants[].name/wxid</code>。</p>
+<hr>
+<h2>3. L2 —— 本地分析库 <code>wxlocal/wxbase.db</code>（六表）</h2>
+<h3>3.1 <code>wx_messages</code> —— 消息主表</h3>
+<div class="tw"><table><thead><tr><th>列</th><th>类型</th><th>来源（L1）</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td>int PK</td><td>—</td><td>自增</td></tr>
+<tr><td><code>chat_raw</code></td><td>text</td><td><code>&lt;slug&gt;</code> 去 <code>wx_</code></td><td>会话 slug（群 <code>demo_group_alpha</code> / 私聊 <code>dm_example</code>）</td></tr>
+<tr><td><code>chat_type</code></td><td>text</td><td><code>chats[].kind</code></td><td><code>group</code> \</td></tr>
+<tr><td><code>sid</code></td><td>text</td><td><code>m.sid</code></td><td>server_id</td></tr>
+<tr><td><code>sq</code></td><td>int</td><td><code>m.sq</code></td><td>sort_seq</td></tr>
+<tr><td><code>sender_full</code></td><td>text</td><td><code>participants[s].name</code></td><td>花名册全名（<code>me</code> → <code>"我"</code>）</td></tr>
+<tr><td><code>sender_wxid</code></td><td>text</td><td><code>participants[s].wxid</code></td><td>花名册 wxid</td></tr>
+<tr><td><code>is_me</code></td><td>int</td><td><code>s == "me"</code></td><td>1/0</td></tr>
+<tr><td><code>text</code></td><td>text</td><td><code>m.c</code></td><td><strong>保留引用全貌</strong>（<code>[引用消息]… [↩ 群id: 原文]</code>）</td></tr>
+<tr><td><code>ty</code></td><td>text</td><td><code>m.ty</code></td><td>类型标签</td></tr>
+<tr><td><code>at_users</code></td><td>text</td><td><code>m.at</code> 的 JSON</td><td><code>["wxid_a",…]</code></td></tr>
+<tr><td><code>quote_svrid</code></td><td>text</td><td><code>m.q.svrid</code></td><td>引用目标 server_id</td></tr>
+<tr><td><code>quote_by</code></td><td>text</td><td><code>m.q.by</code></td><td>被引者显示名</td></tr>
+<tr><td><code>quote_wx</code></td><td>text</td><td><code>m.q.wx</code></td><td>被引者 wxid</td></tr>
+<tr><td><code>quote_room</code></td><td>text</td><td><code>m.q.room</code></td><td>被引消息所在会话</td></tr>
+<tr><td><code>quote_ref</code></td><td>text</td><td><code>m.q.ref</code></td><td>被引原文（截断）</td></tr>
+<tr><td><code>ts</code></td><td>int</td><td><code>m.t</code></td><td>unix <strong>秒</strong></td></tr>
+<tr><td><code>ts_ms</code></td><td>int</td><td><code>t × 1000</code></td><td>毫秒（排序/展示用）</td></tr>
+<tr><td><code>ts_iso</code></td><td>text</td><td>由 <code>t</code> 格式化</td><td><code>YYYY-MM-DDTHH:MM:SS</code>（本地时区）</td></tr>
+</tbody></table></div>
+<p><strong>索引</strong>（14 条，含 9 条 wx_messages）：`sender / ts / chat / sid / qsvrid / chattype /</p>
+<p>(chat_raw,ts_ms) / (chat_raw,sender_wxid) / quote_by`。</p>
+<blockquote><p><strong>引用段不剥</strong>：入库时 <code>text</code> <strong>保留</strong> <code>[引用消息]评论 [↩ 群id: 原文]</code> 全貌（供上下文还原</p><p>与引用边构建）；<strong>只有</strong>算「评论正文」指标（均长/疑问率）才调 <code>_common.strip_quote()</code>。</p></blockquote>
+<h3>3.2 <code>wx_coref</code> —— 指称词典（一人多名）</h3>
+<div class="tw"><table><thead><tr><th>列</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>person</code></td><td>归并后的规范名（花名册主名）</td></tr>
+<tr><td><code>alias</code></td><td>别名（群名片 / 孪生账号名 / wxid）</td></tr>
+<tr><td><code>alias_type</code></td><td><code>card</code>（群名片种子）\</td></tr>
+<tr><td><code>evidence</code></td><td>来源证据（如 <code>chat_room.ext_buffer@demo_group_alpha</code>、<code>openim孪生@…</code>）</td></tr>
+<tr><td><code>UNIQUE(person, alias)</code></td><td>去重</td></tr>
+</tbody></table></div>
+<p>三类来源：<code>card</code>（分析层从 <code>cards.json</code> 灌入的群名片）／<code>wxid</code>（分析层 <code>build_graph.py</code> 追加的 wxid 别名）／</p>
+<p><code>identity</code>（<code>identities.json</code> 登记的同人账号）。<strong>具体行数随语料而定，不预设期望值</strong>。</p>
+<h3>3.3 <code>wx_edges</code> —— 关系边</h3>
+<div class="tw"><table><thead><tr><th>列</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>src</code> / <code>dst</code></td><td>两端人名（花名册全名）</td></tr>
+<tr><td><code>etype</code></td><td><code>at</code>（建库产出）\</td></tr>
+<tr><td><code>strength</code></td><td>频次</td></tr>
+<tr><td><code>chat</code></td><td>所属会话</td></tr>
+<tr><td><code>first_ts</code> / <code>last_ts</code></td><td>首次/末次</td></tr>
+</tbody></table></div>
+<p>三类边：<code>at</code>（建库时产，来自 <code>atuserlist</code>）；<code>reply</code>（分析前置 <code>build_graph.py</code> 产，<code>quote_svrid</code> 精确 join，</p>
+<p>命中率高）；<code>cooccur</code>（分析前置产，±5 发言位窗）。<strong>建库只产 @ 边，其余归分析前置</strong>（职责分离）。</p>
+<p><code>strength</code> 为该边累计次数（被 @ 次数 / 被引用次数 / 共现次数）。</p>
+<h3>3.4 <code>wx_membership</code> —— 成员全量（沉默者分母）</h3>
+<div class="tw"><table><thead><tr><th>列</th><th>说明</th></tr></thead><tbody>
+<tr><td><code>room</code></td><td>会话 slug</td></tr>
+<tr><td><code>display</code></td><td>会话显示名</td></tr>
+<tr><td><code>wxid</code> / <code>name</code></td><td>成员 wxid / 花名册名</td></tr>
+<tr><td><code>chat_type</code></td><td><code>group</code> \</td></tr>
+<tr><td><code>spoke</code></td><td>是否在消息表发言过（1/0）——<strong>分母口径关键</strong></td></tr>
+<tr><td><code>card</code></td><td>群名片</td></tr>
+</tbody></table></div>
+<p>口径：群按成员快照展开为行，<code>spoke=0</code> 即<strong>从未在消息表出现</strong>的成员（沉默者，是真实分母的一部分）；</p>
+<p>具体行数与沉默比例<strong>随群而定，不预设</strong>。私聊同样记 1 行（对手方），使分母口径与群一致。</p>
+<blockquote><p>注意：沉默率只有「成员快照 ≥ 发言人数」时才可算，否则应标"不可算"而非 0。</p></blockquote>
+<h3>3.5 <code>wx_profile_features</code> —— 特征指纹（分析层）</h3>
+<p><code>person</code> PK ／ <code>n_msgs</code> <code>avg_len</code> <code>emoji_rate</code> <code>question_rate</code> <code>tech_rate</code> <code>peak_hour</code></p>
+<p><code>night_rate</code> <code>top_hours</code>。由分析层 <code>build_graph.py</code> 按 <code>FEAT_MIN_MSGS</code> 阈值筛选后灌入。</p>
+<h3>3.6 <code>wx_verify</code> —— 事实验证登记（分析层）</h3>
+<p><code>entity</code> <code>claim</code> <code>source_msg_ts</code> <code>level</code>(A/B/C) <code>status</code> <code>evidence</code> <code>check_date</code>。<strong>行数由实际核验条目决定，不预设期望值。</strong></p>
+<h3>3.7 与云端五表的对齐 / 升级</h3>
+<div class="tw"><table><thead><tr><th>维度</th><th>云端 social-chat-analysis</th><th>本机 wxbase.db</th></tr></thead><tbody>
+<tr><td>会话范围</td><td>只有群</td><td><strong>群 + 私聊</strong>（<code>chat_type</code> 区分）</td></tr>
+<tr><td>文本纯净度</td><td>保留存储层 <code>wxid:</code> 前缀</td><td><strong>导出 + 入库双重剥离，残留 0</strong></td></tr>
+<tr><td>引用定位</td><td>20 字键文本匹配 94–98%</td><td><strong>svrid join 99.8%</strong></td></tr>
+<tr><td>@ 识别</td><td>文本别名匹配（曾炸出大量假边）</td><td><strong><code>at_users</code> 精确 wxid</strong></td></tr>
+<tr><td>沉默者分母</td><td>只有发言者</td><td><strong>membership 全量</strong></td></tr>
+<tr><td>身份归并</td><td>无</td><td><strong><code>identities.json</code> + openim 孪生自动归并</strong></td></tr>
+</tbody></table></div>
+<hr>
+<h2>4. 字段溯源矩阵（L2 ← L1 ← L0）</h2>
+<div class="tw"><table><thead><tr><th>L2 (<code>wx_messages</code>)</th><th>L1 (<code>wxexport/2.1</code>)</th><th>L0（加密库 · 明文后）</th></tr></thead><tbody>
+<tr><td><code>chat_raw</code> / <code>chat_type</code></td><td>文件名 slug / <code>chats[].kind</code></td><td>会话 wxid（<code>@chatroom</code> 判定）</td></tr>
+<tr><td><code>sender_full</code> / <code>sender_wxid</code></td><td><code>participants[s].{name,wxid}</code></td><td><code>real_sender_id → Name2Id.rowid → wxid → contact</code></td></tr>
+<tr><td><code>is_me</code></td><td><code>s == "me"</code></td><td><code>wxid ∈ me 账号集</code>（<code>identities.json</code>）</td></tr>
+<tr><td><code>text</code></td><td><code>m.c</code>（剥前缀后）</td><td><code>message_content</code>（zstd 解压后，<strong>引文保留</strong>）</td></tr>
+<tr><td><code>ty</code></td><td><code>m.ty</code></td><td><code>local_type % 2³²</code> 映射</td></tr>
+<tr><td><code>at_users</code></td><td><code>m.at</code></td><td><code>source</code> 的 <code>&lt;atuserlist&gt;</code></td></tr>
+<tr><td><code>quote_*</code></td><td><code>m.q.{svrid,by,wx,ref,room}</code></td><td><code>refermsg</code> 字段</td></tr>
+<tr><td><code>ts</code> / <code>ts_ms</code> / <code>ts_iso</code></td><td><code>m.t</code></td><td><code>create_time</code>（秒）</td></tr>
+<tr><td><code>sq</code> / <code>sid</code></td><td><code>m.sq</code> / <code>m.sid</code></td><td><code>sort_seq</code> / <code>server_id</code></td></tr>
+<tr><td><code>wx_membership.*</code></td><td><code>membership.json</code></td><td><code>chatroom_member × contact</code>（群）/ <code>contact</code>（私聊）</td></tr>
+<tr><td><code>wx_edges(at)</code></td><td><code>m.at</code></td><td><code>atuserlist</code></td></tr>
+<tr><td><code>wx_coref(card)</code></td><td><code>cards.json</code></td><td><code>chat_room.ext_buffer</code> PB</td></tr>
+</tbody></table></div>
+<hr>
+<h2>5. 口径与坑（回退即出错）</h2>
+<div class="tw"><table><thead><tr><th>#</th><th>铁律</th><th>证据</th></tr></thead><tbody>
+<tr><td>1</td><td>key 有效性 = <code>message_0.db</code> 第一页实测，<strong>不是</strong>文件存在</td><td><code>bootstrap.verify_key</code></td></tr>
+<tr><td>2</td><td>发送者链<strong>分库解析</strong>（msg0/msg1 的 Name2Id 各自独立）</td><td>大群抽样核对，零反例</td></tr>
+<tr><td>3</td><td>昵称优先级 <code>remark &gt; nick_name &gt; alias &gt; wxid</code></td><td><code>export21._load_name_maps</code></td></tr>
+<tr><td>4</td><td>冗余前缀 <code>"&lt;发送者wxid&gt;: "</code> <strong>导出剥 + 入库兜底</strong></td><td>全量核对：前缀 == 发送者 wxid</td></tr>
+<tr><td>5</td><td>被引原文同样剥前缀</td><td>全量核对：前缀 == <code>chatusr</code></td></tr>
+<tr><td>6</td><td><strong>入库不剥引用</strong>；只有算「评论正文」指标才 <code>strip_quote</code></td><td>坑#9 引用污染（曾致均长虚高 40–50%）</td></tr>
+<tr><td>7</td><td><code>local_type</code> 过滤<strong>必须取模</strong> <code>% 4294967296</code></td><td><code>= 49</code> 零命中</td></tr>
+<tr><td>8</td><td><code>@</code> 精确走 <code>atuserlist</code>（携带率 34%），别名匹配仅回退</td><td><code>docs/fusion-analysis.md</code> F2</td></tr>
+<tr><td>9</td><td>引用 join 用 <code>sid</code>（svrid）优先，文本匹配回退</td><td>svrid join 98.3%</td></tr>
+<tr><td>10</td><td>同一指标多处实现必须<strong>对拍</strong>（坑#29）</td><td>曾有 <code>strip_quote</code> 双实现口径分叉</td></tr>
+<tr><td>11</td><td>抽样 seed 用 <strong>md5</strong> 不用 <code>hash</code>（PYTHONHASHSEED 不稳）</td><td><code>group_profile._stable_seed</code></td></tr>
+<tr><td>12</td><td><code>me</code> 的 wxid <strong>恒取 <code>identities.json</code> 首位</strong></td><td><code>export21._me_wxids</code></td></tr>
+<tr><td>13</td><td>同名/唯一前缀名的 openim 孪生才归并；纯企微号保留</td><td><code>build_db21</code> openim 分支</td></tr>
+<tr><td>14</td><td>私聊的别名成员行<strong>不可无条件删</strong>（会把分母清 0）</td><td>实测 <code>dm_wxid_example001</code></td></tr>
+<tr><td>15</td><td>建库<strong>默认清空重灌</strong>（幂等），否则翻倍</td><td>重建两次核对总数须一致</td></tr>
+<tr><td>16</td><td>导出<strong>覆盖写</strong> → 增量/合并前先备份；合并 <strong>shrink 即回滚</strong></td><td><code>run_batch21</code> 不变量</td></tr>
+<tr><td>17</td><td>窗内 0 条<strong>照记</strong> <code>empty:true</code>，不跳过</td><td>窗内静默的会话<strong>是事实</strong></td></tr>
+<tr><td>18</td><td><code>--since/--until</code> <strong>两端含</strong>；显式区间时 <code>--days</code> 忽略、下界不限</td><td><code>resolve_window</code></td></tr>
+<tr><td>19</td><td><code>--inc</code> 只能往新续，<strong>不能回填</strong>（回填用 <code>--days 0</code>）</td><td><code>read_history</code></td></tr>
+<tr><td>20</td><td>池条目 <code>kw</code> <strong>一律 wxid</strong>（群名会撞名）</td><td><code>wxflow</code> 建池</td></tr>
+<tr><td>21</td><td>清单 group/private <strong>分离</strong>，异类条目告警丢弃</td><td><code>load_list</code></td></tr>
+<tr><td>22</td><td><code>main()</code> 必须 <code>sys.exit(main())</code>（否则退出码恒 0）</td><td><code>run_batch21.py</code> 注释</td></tr>
+<tr><td>23</td><td>分析层词表<strong>只许粗筛/抽样/异常触发</strong>，不得输出定性标签</td><td>云端 skill 铁律</td></tr>
+</tbody></table></div>
+<hr>
+<h2>6. 建库后自检清单（不含任何预设规模）</h2>
+<p><strong>本文档刻意不提供任何绝对规模数字</strong>（会话数、消息条数、边数、成员数一律省略）。</p>
+<p>原因：规模本身即隐私，且随每个人语料不同而变；写死数字还会让文档随语料增长迅速失效。</p>
+<p>正确的核对方式——<strong>只查「导出口径」与「库内口径」是否一致</strong>，不看绝对量：</p>
+<p>```bash</p>
+<h1>① 导出总量（各会话 messages 之和）</h1>
+<p>PYTHONUTF8=1 .venv/Scripts/python.exe -c "</p>
+<p>import json,glob</p>
+<p>n=sum(len(json.load(open(f,encoding='utf-8'))['messages'])</p>
+<p>for f in glob.glob('wxlocal/exports21/*.json') if not f.endswith('cards.json'))</p>
+<p>print('exports21 messages =', n)"</p>
+<h1>② 库内消息总量 —— 必须等于 ①</h1>
+<p>PYTHONUTF8=1 .venv/Scripts/python.exe -c "</p>
+<p>import sqlite3</p>
+<p>db=sqlite3.connect('wxlocal/wxbase.db')</p>
+<p>print('wx_messages =', db.execute('SELECT COUNT(*) FROM wx_messages').fetchone()[0])"</p>
+<h1>③ 幂等自检：重建前后两次 ② 必须一致</h1>
+<h1>若第二次翻倍 → 说明走了追加而非清空重灌（违反不变量 19）</h1>
+<p>```</p>
+<div class="tw"><table><thead><tr><th>校验项</th><th>期望关系（比值口径，与规模无关）</th></tr></thead><tbody>
+<tr><td><code>wx_messages</code> ↔ <code>exports21/messages</code> 总数</td><td><strong>相等</strong></td></tr>
+<tr><td>含 <code>sq</code> 占比</td><td>≈ 100%（v2.1 起全量携带）</td></tr>
+<tr><td>含 <code>sid</code> 占比</td><td>接近 100%，仅极少数异常行缺失</td></tr>
+<tr><td>含引用 <code>q</code>／含 <code>at</code> 占比</td><td>个位数～低两位数百分比（随群性质浮动）</td></tr>
+<tr><td><code>wx_edges</code> 内部拆分</td><td><code>at + reply + cooccur</code> = 总边数（<code>build_graph.py</code> 跑完后）</td></tr>
+<tr><td>重建两次的 ②</td><td><strong>完全一致</strong>（幂等）</td></tr>
+</tbody></table></div>
+<blockquote><p>记不住数字是对的：<strong>任何"这个库应该有 X 条"的硬编码期望都是 bug</strong>。</p><p>判断健康与否看<strong>一致性</strong>（① = ②、重建幂等），不看<strong>绝对量</strong>。</p></blockquote>
+<hr>
+<h2>6.1 时间窗与备份</h2>
+<p>导出窗口（<code>--days N</code>）决定入库范围；窗口取值只影响条目多少，不影响 schema。做对比实验或改变窗口前，</p>
+<p>建议先备份 <code>wxlocal/wxbase.db</code>（或整个 <code>wxlocal/exports21/</code>），便于回滚与对拍。</p>
+<hr>
+<h2>7. 下游衔接</h2>
+<p>L2 建库完成后即进入<strong>分析层</strong>（不在数据准备范围，见 skill <code>wechat-corpus-pipeline</code> / <code>wxlocal/analyze/</code>）：</p>
+<p>```</p>
+<p>wxbase.db ─→ build_graph.py(D2-D4: reply/cooccur 边 + 指纹 + coref 补 wxid)</p>
+<p>─→ 分析工具 20 个（群三维 / 人物证据卡 / 引用网络 / 观点演化 …）</p>
+<p>─→ md_report.py 渲染 HTML</p>
+<p>```</p>
+<p>分析原则（承自云端 skill）：<strong>代码只做 D1–D4 数据准备，D5–D7 语义判断全交 LLM</strong>。</p>
+<div class="foot">生成于 <渲染时刻> · 由 md_report.py 渲染（单文件离线可开）</div>
+</div></div></body></html>

@@ -1,132 +1,108 @@
-# wechat-decrypt
+# 微信语料工具链（wechat-corpus-toolkit）
 
-[![tests](https://github.com/tzwkb/wechat-decrypt/actions/workflows/tests.yml/badge.svg)](https://github.com/tzwkb/wechat-decrypt/actions/workflows/tests.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+从「微信 4.x 本地加密数据库」到「可分析的结构化语料 + 分析结论」，**全程不出本机**。
 
-English | [中文](README_ZH.md)
+本仓库是 [tzwkb/wechat-decrypt](https://github.com/tzwkb/wechat-decrypt) 的**下游扩展发行版**：
+以全盘 fork 继承上游解密/提 key 能力，叠加本项目的**导出 → 建库 → 分析**完整工具链。
 
-A local-first [Codex Skill](https://developers.openai.com/codex/skills) for reading, searching, summarizing, exporting, and transcribing WeChat 4.x history on macOS and Windows. The command-line core also works without MCP; the bundled server provides an optional [Codex MCP](https://developers.openai.com/codex/mcp) facade.
-
-Use it only with local data you own or are authorized to access.
-
-## What it does
-
-- Lists chats and resolves contact remarks, nicknames, aliases, and group names.
-- Reads, searches, summarizes, and measures messages across multiple database shards.
-- Classifies pats, recalls, group/friend changes, red packets, payments, calls, pins, and unknown system events.
-- Parses music, video links, Channels/live streams, mini programs, files, quotes, and unknown share cards while preserving titles, descriptions, sources, and URLs.
-- Exports a contact and date range without an artificial message-count cap.
-- Transcribes locally downloaded SILK voice messages with Whisper.
-- Diagnoses the installation without exposing raw keys.
-- Supports verified macOS and Windows key/decryption flows.
-
-```text
-macOS:  encrypted WeChat DB ── raw key ── SQLCipher read-only ─┐
-                                                               ├─ query.py ── CLI / MCP
-Windows: encrypted WeChat DB ── raw key ── private plaintext ──┘             └─ export / voice
+```
+微信加密库 ──[上游: 提key/解密]──> 明文镜像 ──[wxlocal: 导出/建库]──> wxbase.db ──[wxlocal/analyze]──> 分析报告
+(SQLCipher)                        (scripts/)          (export21/build_db21)  (六表)        (25 个分析脚本)
 ```
 
-## Quick start
+## 与上游的关系
 
-Clone the repository, then run the setup script from its root.
+| 层 | 内容 | 来源 |
+|---|---|---|
+| 基座 | `config/db/crypto/message/appmsg/contacts`、`scripts/`（提 key/解密/诊断/查询）、`server.py`、测试 | **上游 wechat-decrypt**（git 历史完整保留，可直接 `git merge upstream/main` 跟随上游） |
+| 扩展 | `wxlocal/`（导出 wxexport/2.1、批量/增量/合并、建库六表、状态机、key 守望）、`wxlocal/analyze/`（25 个分析脚本）、`skills/`（两份 SKILL 手册 + 数据结构文档） | **本项目**（Sonnet.G） |
 
-### macOS
+MIT 双署名见 [LICENSE](LICENSE)：上游代码版权归 cocofeng（tzwkb/wechat-decrypt），扩展部分版权归 Sonnet.G。
+
+## 安装
 
 ```bash
-bash setup.sh
-.venv/bin/python scripts/common/doctor.py --json
+git clone https://github.com/Sonnet0524/wechat-corpus-toolkit.git
+cd wechat-corpus-toolkit
+python -m venv .venv
+.venv/Scripts/pip install -r requirements-windows.txt networkx matplotlib
 ```
 
-Setup creates an isolated `.venv`, installs SQLCipher and Python dependencies, links the checkout at `$HOME/.agents/skills/wechat-decrypt`, and registers the `wechat` stdio MCP server with Codex. Missing keys and local caches are migrated from the legacy `$HOME/.codex/skills/wechat-decrypt` copy without overwriting current files. If the user-skill path points to another checkout, inspect it first and then run `bash setup.sh --upgrade`; the previous path is retained as a timestamped backup.
+- **Windows 10/11**（提 key / 解密为 Windows 路径）
+- Python 3.10+
+- 可选：分析层 `circle_map.py` / `network3.py` 需 `networkx` + `matplotlib`（上面的命令已一并安装）
 
-Core setup stays lightweight. Install the optional local voice stack only when needed with `bash setup.sh --with-voice`; this installs sizeable ML libraries but not the approximately 3 GB model.
+## 快速开始
 
-First-time key extraction requires temporary ad-hoc signing:
+### 第一步 · 数据准备（提 key → 解密 → 导出 → 建库）
 
 ```bash
-sudo codesign --force --deep --sign - /Applications/WeChat.app
-bash scripts/macos/extract_key.sh
+export PYTHONUTF8=1
+.venv/Scripts/python.exe wxlocal/bootstrap.py --check     # 六步诊断
+.venv/Scripts/python.exe wxlocal/bootstrap.py             # 交互引导，缺哪补哪
 ```
 
-The script closes WeChat, opens it through Frida, and waits for QR login. After the key is captured, reinstall WeChat from the App Store or official site to restore Tencent's signature. See [the macOS guide](references/macos.md) before extracting.
+提 key 说明（详见 `skills/SKILL-data-prep.md`）：
 
-### Windows
-
-```powershell
-powershell -File setup.ps1
-$Python = ".\.venv\Scripts\python.exe"
-& $Python scripts\windows\extract_raw_key.py
-& $Python scripts\windows\decrypt_all.py
-& $Python scripts\common\doctor.py --json
-```
-
-The extractor closes WeChat and asks you to restart it manually from the visible desktop. `decrypt_all.py` then creates a private local plaintext mirror used by the read-only query layer. See [the Windows guide](references/windows.md).
-
-For an existing user-skill junction that points elsewhere, use `powershell -File setup.ps1 -Upgrade`. Private files are copied only when missing; an existing `decrypted/` mirror is linked rather than duplicated.
-
-Install the optional Windows voice stack with `powershell -File setup.ps1 -WithVoice`. Ordinary query and export do not require it.
-
-## Query
-
-Agents should prefer `--json`; omit it for human-readable output.
+> ⚠️ 提 key 会**关闭微信**，随后自动代启动微信（实测 `os.startfile` 代启动可正常开库），
+> 你只需在窗口期内**完成登录**。守望模式（脱离式，推荐）：
+> `.venv/Scripts/python.exe wxlocal/key_daemon.py start`
 
 ```bash
-.venv/bin/python scripts/common/query.py list --json
-.venv/bin/python scripts/common/query.py read "Alice" -d 7 -n 50 --json
-.venv/bin/python scripts/common/query.py search "deadline" -d 30 -n 50 --json
-.venv/bin/python scripts/common/query.py recent -d 3 -n 100 --json
-.venv/bin/python scripts/common/query.py summary -d 3 --json
-.venv/bin/python scripts/common/query.py events -e pat -d 30 -n 100 --json
+.venv/Scripts/python.exe scripts/windows/decrypt_all.py          # ② 全量解密 → decrypted/
+.venv/Scripts/python.exe wxlocal/wxflow.py sync-groups           # ④ 建群候选池
+.venv/Scripts/python.exe wxlocal/wxflow.py select --kind group --recent 90 --state on
+.venv/Scripts/python.exe wxlocal/run_batch21.py                  # 导出已勾选 → exports21/
+.venv/Scripts/python.exe wxlocal/build_db21.py                   # ⑤ 建库 → wxlocal/wxbase.db
 ```
 
-Stable event filters are `pat`, `recall`, `group_join`, `group_remove`, `group_leave`, `group_rename`, `group_notice`, `group_admin`, `group_owner`, `group_disband`, `friend_added`, `red_packet`, `payment`, `call`, `chat_pinned`, and `system`. Chinese labels are also accepted.
+### 第二步 · 分析（群 / 人物 / 关系 / 观点）
 
-Type-49 share cards use the same parser in reads, searches, summaries, statistics, and exports. JSON output adds an `app` object with a stable kind, title, description, source, URL, and music/Channels/mini-program metadata. Unknown subtypes preserve common card fields and remain searchable through their local payload.
+```bash
+export PYTHONUTF8=1
+.venv/Scripts/python.exe wxlocal/analyze/build_graph.py                       # G0 前置: 建图/指纹
+.venv/Scripts/python.exe wxlocal/analyze/build_overview_page.py               # 全库总览页(HTML)
+.venv/Scripts/python.exe wxlocal/analyze/group_dossier.py --min-days 30 --top 5
+.venv/Scripts/python.exe wxlocal/analyze/dm_profile.py --list --top 20        # 私聊画像
+```
 
-Search decodes every compressed-text and type-49 candidate in bounded pages, so results are not limited to a fixed recent-card window. It does not create a persistent plaintext search index.
+**分析哲学**：代码只做 D1–D4（数据准备：结构数学 / 候选包 / 证据卡），D5–D7（语义判断）全部交给 LLM。
+两份手册供 agent 自动路由：
 
-The MCP server exposes the same core operations:
+- [`skills/SKILL-data-prep.md`](skills/SKILL-data-prep.md) — 数据准备手册（六阶段 + 30 条不变量 + 典型坑）
+- [`skills/SKILL-corpus-pipeline.md`](skills/SKILL-corpus-pipeline.md) — 分析手册（批次 + 选题闭环 + D1–D7 分层）
 
-| Tool | Purpose |
+把 `skills/SKILL-*.md` 复制进你的 agent skill 目录（如 `~/.workbuddy/skills/wechat-data-prep/SKILL.md`，
+`code/` 指向本仓库根）即可用自然语言触发。
+
+## 已知环境坑（实测）
+
+| 坑 | 处置 |
 |---|---|
-| `wechat_list_chats` | List conversations |
-| `wechat_read_chat` | Read one contact or group |
-| `wechat_search_messages` | Full-text search |
-| `wechat_recent_messages` | Review recent activity |
-| `wechat_chat_summary` | Structured recent-chat context |
-| `wechat_system_events` | Pats, recalls, group/friend changes, payments, calls, pins, and unknown events |
+| 仓库路径含中文/非 ASCII | 计划任务 bat（ASCII 写盘）会乱码 → **clone 到纯 ASCII 路径** |
+| schtasks 日期格式 | 中文系统短日期为 `yyyy/M/d`，美式 `M/d/yyyy` 被拒；已用 `2099/12/31` 规避 |
+| 计划任务「已排队」但不执行 | 电源判定为电池时默认 `DisallowStartIfOnBatteries` 静默拦截；key_daemon 已自动关闭该限制 |
+| 微信装在非 C 盘 | `wxlocal/key_daemon.py` 的 `WEIXIN` 常量按实际安装路径修改 |
+| Documents 重定向（如 HuaweiMoveData） | 提 key 扫 `C:\Users\*\Documents\xwechat_files`；建 junction：`mklink /J C:\Users\<你>\Documents\xwechat_files\<account> <真实目录>` |
 
-## Export and voice
+## 隐私与合规
 
-```bash
-.venv/bin/python scripts/common/export_chat.py "Alice" --year 2026 -o ~/Desktop/alice-2026.txt
-.venv/bin/python scripts/common/export_chat.py "Alice" --start 2026-01-01 --end 2026-06-30
-```
+- 本仓库**不含任何真实数据**：无聊天记录、联系人、wxid、设备 key；文档示例均为虚构占位。
+- **不含语料规模数字**——只写口径与自检方法，不写绝对量。
+- 运行时产物（`key_windows.txt`、`decrypted/`、`exports21/`、`*.json` 池/清单、`reports/`）已在 `.gitignore` 排除，**任何数据都不出本机**。
+- 仅处理你**有权访问**的数据；分析结果含他人信息时，对外发布前**必须自行脱敏**。
+- 提 key 依赖 Frida 注入，**仅在你自己的设备上、对自己有权访问的数据使用**。遵守当地法律法规及微信/腾讯服务条款。
 
-If the platform's Whisper large-v3 model is already cached, voice transcription is automatic. Otherwise ordinary export leaves `[Audio]` and does not download a model. Use `--transcribe` only after approving the approximately 3 GB first download, or `--no-transcribe` to disable transcription. See [the export and transcription guide](references/export-transcription.md).
-
-## Security model
-
-- Query backends open databases read-only; SQLite writes are blocked with `query_only`.
-- Raw keys are validated, stored with private permissions, ignored by Git, and never echoed by extractors or diagnostics.
-- Plaintext databases, exports, derived-key caches, and voice caches use private permissions where supported.
-- The project does not upload chat data or use a cloud transcription service.
-- `key.txt`, `key_windows.txt`, `decrypted/`, `all_keys.json`, `contacts.json`, and `voice_cache.json` must never be committed.
-
-## Development
-
-Unit tests use synthetic databases and require no personal WeChat data. The Windows extractor tests also execute its embedded JavaScript against synthetic memory using Node.js 22 or newer. Install test dependencies with `python3 -m pip install pytest pycryptodome 'mcp[cli]>=1,<2'`:
+## 跟随上游同步
 
 ```bash
-python3 -m pytest -q
-python3 -m compileall -q appmsg.py config.py contacts.py crypto.py db.py message.py server.py scripts/common scripts/windows
-bash -n setup.sh scripts/macos/extract_key.sh
-.venv/bin/python -c "import asyncio, server; assert len(asyncio.run(server.mcp.list_tools())) == 6"
+git remote add upstream https://github.com/tzwkb/wechat-decrypt.git
+git fetch upstream
+git merge upstream/main        # 上游层零本地改动时通常 fast-forward / 干净合并
 ```
 
-Real-data checks are documented in [e2e/README.md](e2e/README.md). The Skill entrypoint is [SKILL.md](SKILL.md); platform and export details live under `references/` to keep agent context small.
+本仓库对上游文件的唯一改动：`scripts/windows/decrypt_read.py` 输出路径改用 `%TEMP%`（上游硬编码个人用户目录）。合并冲突时优先保留上游版本再重新应用此一行修改。
 
-## License
+## 许可
 
-MIT
+MIT，双署名（见 [LICENSE](LICENSE)）：`Copyright (c) 2026 cocofeng`（上游 tzwkb/wechat-decrypt）+ `Copyright (c) 2026 Sonnet.G`（本项目扩展）。再分发请连同 LICENSE 一并保留。

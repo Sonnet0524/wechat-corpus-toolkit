@@ -21,7 +21,7 @@ for i in range(n):
     dec = AES.new(enc, AES.MODE_CBC, iv).decrypt(ct)
     out += (b"SQLite format 3\x00" + dec + page[rstart:]) if i == 0 else (dec + page[rstart:])
 
-dst = r"C:\Users\claude\_dec_msg0.db"
+dst = r"%TEMP%\_dec_msg0.db"
 open(dst, "wb").write(out)
 try:
     con = sqlite3.connect(dst)

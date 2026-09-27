@@ -1,0 +1,7 @@
+{
+  "_comment": "身份别名配置(人工确认维护)。me: 本人全部账号wxid, 首位为主号; aliases: 他人确认的归并(别名wxid→主号wxid), 由 build_db21 在入库时统一改写",
+  "me": ["wxid_example_main", "example_openim_user@openim"],
+  "aliases": {
+    "wxid_example001": "wxid_example002"
+  }
+}
