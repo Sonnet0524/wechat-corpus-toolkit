@@ -130,7 +130,7 @@ def _data_dir_signature() -> tuple[str, str]:
     root = (
         config.DECRYPTED_DIR
         if config.DB_BACKEND == "sqlite3"
-        else config.WECHAT_DATA_GLOB
+        else "|".join(config.data_globs())      # 可迁移: 多候选根, 不是单条写死的 glob
     )
     return config.DB_BACKEND, root
 
@@ -151,9 +151,14 @@ def find_data_dir() -> str:
         path = _find_decrypted_data_dir()
         _data_dir_cache = signature, path
         return path
-    matches = sorted(glob.glob(config.WECHAT_DATA_GLOB), key=os.path.getmtime, reverse=True)
+    matches = []
+    for g in config.data_globs():
+        matches += glob.glob(g)
+    matches = sorted(set(matches), key=os.path.getmtime, reverse=True)
     if not matches:
-        raise FileNotFoundError(f"未找到 WeChat 数据目录: {config.WECHAT_DATA_GLOB}")
+        raise FileNotFoundError(
+            "未找到 WeChat 数据目录（已试: " + "; ".join(config.data_globs()) + "）。"
+            f"若装在非标准位置，请设 {config.ENV_DATA_ROOT}=<xwechat_files 路径>。")
     key = crypto.load_key()
     for match in matches:
         if any(test_key(key, msg_db) for msg_db in _message_db_candidates(match)):
@@ -167,7 +172,8 @@ def _find_decrypted_data_dir() -> str:
     """Locate the db_storage root inside the decrypted output.
 
     Assumes layout .../db_storage/message/message_N.db (two levels up from the hit).
-    Picks the account with the most-recent active message shard.
+    多账号: 设了 ``WX_ACCOUNT`` 则用它指名的账号目录；否则取 message 分片**最新**的那个
+    （微信运行中持续写它，故最新 ≈ 当前登录账号）。
     """
     hits = glob.glob(
         os.path.join(config.DECRYPTED_DIR, "**", "message", "message_[0-9].db"),
@@ -178,6 +184,12 @@ def _find_decrypted_data_dir() -> str:
             f"未找到解密后的 message_N.db，先运行 scripts/windows/extract_raw_key.py 提 key，"
             f"再 scripts/windows/decrypt_all.py 解密。查找根: {config.DECRYPTED_DIR}"
         )
+    want = (os.environ.get(config.ENV_ACCOUNT) or "").strip()
+    if want:
+        for h in sorted(hits, key=os.path.getmtime, reverse=True):
+            db_storage = os.path.dirname(os.path.dirname(h))       # .../<account>/db_storage
+            if os.path.basename(os.path.dirname(db_storage)) == want:
+                return db_storage
     hits.sort(key=os.path.getmtime, reverse=True)
     return os.path.dirname(os.path.dirname(hits[0]))
 

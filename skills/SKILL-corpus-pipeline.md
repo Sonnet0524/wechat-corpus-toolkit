@@ -23,6 +23,10 @@ wxbase.db ──G0 建图/指纹──> analyze/*.py（结构数学 / 候选包 
 **不在本手册**，走 skill **`wechat-data-prep`**。建库前的任何事 —— key、解密、选群、勾选、
 导出范围、增量、合并、建库 —— 都去那里。
 
+> ⚠ **库必须落在 `analyze/` 的上一级**：分析脚本把库路径**硬编码**为 `<analyze>/../wxbase.db`
+> （本目录工具几乎都不接受 `--db`）。若数据准备层与本分析层是**两棵分开的 `code/` 树**（分发包即如此），
+> 先把它们并成一棵再跑 —— 命令见包顶层 `README.md`「把两半拼成一棵树」。
+
 分析开始前只做**两条只读检查**：
 
 ```bash
@@ -46,7 +50,7 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py delta    # 库是否落�
 
 | 项 | 值 |
 |---|---|
-| 工作目录 | `C:/wechat-decrypt` |
+| 工作目录 | `C:/wechat-decrypt`（仓库布局；**分发包里 = 你把两半合并后的 `code/` 根**） |
 | Python | `.venv/Scripts/python.exe`（Windows 控制台**必须**加 `PYTHONUTF8=1`） |
 | 库 | `wxlocal/wxbase.db`（六表，由 `wechat-data-prep` 建） |
 | 工具目录 | `wxlocal/analyze/` |
@@ -78,7 +82,7 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py menu --batch G1   # 展�
 |---|---|---|
 | `G0` | 图与指纹构建（**前置**） | build_graph |
 | `G1` | 群画像 | group_dossier / group_profile / group_matrix / group_overlap / network3 |
-| `P1` | 个人画像 | person_dossier / turn_window / deep3 / chat_interaction / pairs_extract / address_thermo |
+| `P1` | 个人画像 | person_dossier / turn_window / dump_turn_windows / deep3 / chat_interaction / pairs_extract / address_thermo |
 | `R1` | 关系引述 | quoted_by / quote_ctx / pairs_extract |
 | `O1` | 观点金句 | opinion_evolve / golden_quote |
 | `S1` | 语义层数据准备（候选包） | dump_opinions / opinion_fingerprint / consistency_check / verify_entity |
@@ -97,6 +101,11 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/analyze/pairs_extract.py --between
 
 **人名用花名册全名**（如 `示例用户A`），简称可前缀匹配但歧义时会返回多个候选。
 **工具只产出结构数学与候选包，语义判断由 LLM 承担**。
+
+**依赖**：绝大多数工具**只用标准库**。仅 `network3`（圈层/传播链）与 `circle_map`（圈层图 PNG）
+需要可选的 **`networkx`**（`circle_map` 另需 `matplotlib`）。这两个依赖已改为**延迟导入**：
+没装时 `wxflow.py menu` 枚举、`--help` 都照常，只在真跑这两个工具时才报错并提示
+`pip install networkx matplotlib`（`rc=3`）。
 
 ---
 

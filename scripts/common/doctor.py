@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Read-only environment diagnostics for wechat-decrypt."""
+"""Read-only environment diagnostics for the wechat-corpus-toolkit.
+
+只检查**本工具链随包提供**的能力 —— 不检查不随包分发的上游组件
+（MCP server / Codex 集成 / 用户级 skill 链接 / 语音转写），检查那些只会
+给出指向**不存在文件**的误导性提示。
+
+  · 平台/Python   → ⑥ 分析层（wxlocal/analyze）为纯标准库，可跨平台；①提key/②解密仅 Windows
+  · weixin        → 微信主程序位置（运行时探测: 环境变量→注册表→各盘→PATH→限深搜索）
+  · accounts      → 登录过的账号目录（含 db_storage 的才算），多账号时提示 WX_ACCOUNT
+  · key           → key_windows.txt（64 位 hex）
+  · database      → decrypted/<account>/db_storage/**/message_[0-9].db
+  · 依赖          → frida / pycryptodome / zstd 解压后端
+  · layout        → 已建 wxbase.db 时，分析层是否已并入同一 wxlocal/
+"""
 
 import argparse
 import glob
@@ -8,14 +21,16 @@ import json
 import os
 import platform
 import re
-import shutil
 import stat
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+KEY_REF = "scripts/windows/extract_raw_key.py"
+DECRYPT_REF = "scripts/windows/decrypt_all.py"
+REQ_REF = "requirements-windows.txt"
 
 
 @dataclass(frozen=True)
@@ -30,86 +45,61 @@ def _has_module(*names: str) -> bool:
     return any(importlib.util.find_spec(name) is not None for name in names)
 
 
-def _voice_backend_check(system: str) -> Check:
-    if system == "Darwin":
-        module = "mlx_whisper"
-        label = "mlx-whisper"
-        fix = "Run: bash setup.sh --with-voice"
-    else:
-        module, label, fix = (
-            "faster_whisper",
-            "faster-whisper",
-            "Run: powershell -File setup.ps1 -WithVoice",
-        )
-    available = _has_module(module)
-    return Check(
-        "voice-backend",
-        "ok" if available else "warn",
-        (
-            f"{label} available"
-            if available
-            else f"{label} not installed; ordinary export still works"
-        ),
-        "" if available else fix,
-    )
-
-
-def _mcp_api_check() -> Check:
+def _config_module():
+    """导入仓库根的 config.py（运行时定位）。不可用时返回 None，不抛。"""
     try:
-        from mcp.server.fastmcp import FastMCP  # noqa: F401
-    except (ImportError, ModuleNotFoundError) as exc:
-        return Check(
-            "dependency:mcp-api",
+        if SKILL_DIR not in sys.path:
+            sys.path.insert(0, SKILL_DIR)
+        import config  # noqa: PLC0415
+        return config
+    except Exception:
+        return None
+
+
+def _location_checks(cfg) -> list[Check]:
+    """① 前置定位检查：微信主程序在哪 / 登录过哪些账号（均可迁移，不写死盘符）。"""
+    if cfg is None:
+        return [Check(
+            "location",
             "warn",
-            f"FastMCP v1 API unavailable: {exc}",
-            "Run setup again to install mcp>=1,<2",
-        )
-    return Check("dependency:mcp-api", "ok", "FastMCP v1 API available")
-
-
-def _mac_key_database_check(skill_dir: str, data_dirs: list[str]) -> Check:
-    databases = sorted(
-        database
-        for data_dir in data_dirs
-        for database in glob.glob(
-            os.path.join(data_dir, "message", "message_[0-9].db")
-        )
-        if os.path.isfile(database)
-    )
-    if not databases:
-        return Check(
-            "key-database",
-            "fail",
-            "No active message database available for key validation",
-            "Open and sign in to WeChat",
-        )
-    probe = (
-        "import crypto,db,sys; "
-        "raise SystemExit(0 if db.test_key(crypto.load_key(), sys.argv[1]) else 1)"
-    )
-    for database in databases:
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", probe, database],
-                cwd=skill_dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=12,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if result.returncode == 0:
-            return Check(
-                "key-database",
-                "ok",
-                "Current key opens a message database",
-            )
-    return Check(
-        "key-database",
-        "fail",
-        "Current key cannot open any message database",
-        "Read references/macos.md and re-extract the key",
-    )
+            "config.py 不可导入 → 无法运行时定位微信/账号目录",
+            "确认 config.py 与 scripts/ 在同一棵树（见包 README「组装全链路」）",
+        )]
+    checks = []
+    wx, tried = cfg.find_weixin_exe()
+    if wx:
+        checks.append(Check("weixin", "ok", wx))
+    else:
+        head = "；".join(str(t) for t in tried[:5]) if tried else "（无候选）"
+        checks.append(Check(
+            "weixin",
+            "warn",
+            f"未定位到 Weixin.exe；试过: {head} …",
+            f"设 {cfg.ENV_WEIXIN}=D:\\路径\\Weixin.exe 显式指定"
+            "（微信装到非 C 盘/自定义目录，或扫描受限目录被拒时用）",
+        ))
+    accounts = cfg.list_accounts()
+    if not accounts:
+        checks.append(Check(
+            "accounts",
+            "warn",
+            "未发现含 db_storage 的账号目录",
+            f"若微信存储位置已改，设 {cfg.ENV_DATA_ROOT}=<xwechat_files 路径>",
+        ))
+    else:
+        acct, why = cfg.choose_account(accounts)
+        others = [a["account"] for a in accounts if a["account"] != acct["account"]]
+        detail = f"{len(accounts)} 个登录过的账号 → 选用 {acct['account']}（{why}）"
+        if others:
+            detail += "；其余: " + ", ".join(others)
+        checks.append(Check(
+            "accounts",
+            "warn" if len(accounts) > 1 else "ok",
+            detail,
+            "" if len(accounts) == 1
+            else f"要处理指定的那个: 设 {cfg.ENV_ACCOUNT}=<账号目录名>",
+        ))
+    return checks
 
 
 def _read_key(path: str) -> tuple[bool, str]:
@@ -123,11 +113,11 @@ def _read_key(path: str) -> tuple[bool, str]:
     return True, "present (64 hex chars)"
 
 
-def _key_check(path: str, reference: str, check_permissions: bool) -> Check:
+def _key_check(path: str) -> Check:
     key_ok, detail = _read_key(path)
     if not key_ok:
-        return Check("key", "fail", detail, f"Read {reference} and extract the key")
-    if check_permissions:
+        return Check("key", "fail", detail, f"Run {KEY_REF} to extract the key")
+    if os.name != "nt":
         try:
             mode = stat.S_IMODE(os.stat(path).st_mode)
         except OSError:
@@ -142,59 +132,21 @@ def _key_check(path: str, reference: str, check_permissions: bool) -> Check:
     return Check("key", "ok", detail)
 
 
-def _same_path(left: str, right: str) -> bool:
-    try:
-        return os.path.samefile(left, right)
-    except OSError:
-        return False
-
-
-def _codex_mcp_check(skill_dir: str) -> Check:
-    codex = shutil.which("codex")
-    if not codex:
-        return Check("mcp", "warn", "Codex CLI not found", "Install Codex or use query.py directly")
-    try:
-        result = subprocess.run(
-            [codex, "mcp", "get", "wechat"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return Check("mcp", "warn", f"Could not inspect MCP registration: {exc}", "Run setup again")
-    if result.returncode != 0 or "enabled: true" not in result.stdout:
-        return Check("mcp", "warn", "wechat MCP is not enabled", "Run setup again")
-    expected = os.path.join(skill_dir, "server.py")
-    args_line = next(
-        (line.split(":", 1)[1].strip() for line in result.stdout.splitlines() if line.strip().startswith("args:")),
-        "",
-    )
-    registered = args_line.strip('"')
-    if registered and not _same_path(registered, expected):
-        return Check("mcp", "warn", f"MCP points to another checkout: {registered}", "Run setup from this checkout")
-    return Check("mcp", "ok", "wechat MCP is enabled")
-
-
-def _skill_discovery_check(skill_dir: str) -> Check:
-    official = os.path.expanduser("~/.agents/skills/wechat-decrypt")
-    if _same_path(official, skill_dir):
-        return Check("skill", "ok", f"Discoverable at {official}")
-    return Check(
-        "skill",
-        "warn",
-        f"Current checkout is not linked at {official}",
-        "Run setup again to create the user-skill link",
-    )
-
-
 def collect_checks(system: str | None = None, skill_dir: str = SKILL_DIR) -> list[Check]:
     system = system or platform.system()
     checks = [
         Check(
             "platform",
-            "ok" if system in {"Darwin", "Windows"} else "fail",
+            "ok" if system == "Windows" else ("warn" if system == "Darwin" else "fail"),
             system,
-            "Use macOS or Windows" if system not in {"Darwin", "Windows"} else "",
+            ""
+            if system == "Windows"
+            else (
+                "①提key/②解密仅随包提供 Windows 脚本；"
+                "若已有 wxbase.db，⑥分析层（wxlocal/analyze）为纯标准库，可在本机直接运行"
+                if system == "Darwin"
+                else f"Use Windows for ①/②; the analysis layer runs anywhere: {system}"
+            ),
         ),
         Check(
             "python",
@@ -202,20 +154,40 @@ def collect_checks(system: str | None = None, skill_dir: str = SKILL_DIR) -> lis
             platform.python_version(),
             "Install Python 3.10+" if sys.version_info < (3, 10) else "",
         ),
-        _skill_discovery_check(skill_dir),
-        _codex_mcp_check(skill_dir),
     ]
 
-    if system not in {"Darwin", "Windows"}:
+    # ①提 key / ②解密 只提供 Windows 脚本 —— 非 Windows 到此为止，
+    # 不去报一堆本机用不上的 fail（旧版会因此给出指向 `references/macos.md` 的误导提示）。
+    if system != "Windows":
         return checks
 
-    if not _has_module("mcp"):
-        checks.append(
-            Check("dependency:mcp", "warn", "Python package missing", "Run setup again")
+    # ① 前置：微信装在哪 / 登录过哪些账号（可迁移: 运行时探测, 不写死 C 盘）
+    checks.extend(_location_checks(_config_module()))
+    checks.append(_key_check(os.path.join(skill_dir, "key_windows.txt")))
+
+    decrypted = glob.glob(
+        os.path.join(skill_dir, "decrypted", "**", "message", "message_[0-9].db"),
+        recursive=True,
+    )
+    checks.append(
+        Check(
+            "database",
+            "ok" if decrypted else "fail",
+            f"{len(decrypted)} decrypted message database(s) found",
+            f"Run {DECRYPT_REF}" if not decrypted else "",
         )
-    else:
-        checks.append(Check("dependency:mcp", "ok", "Python package available"))
-        checks.append(_mcp_api_check())
+    )
+
+    for module, label in (("frida", "frida"), ("Crypto", "pycryptodome")):
+        present = _has_module(module)
+        checks.append(
+            Check(
+                f"dependency:{label}",
+                "ok" if present else "warn",
+                "available" if present else "missing",
+                f"pip install -r {REQ_REF}" if not present else "",
+            )
+        )
 
     if _has_module("zstd", "zstandard", "pyzstd"):
         checks.append(Check("dependency:zstd", "ok", "Message decompressor available"))
@@ -225,103 +197,24 @@ def collect_checks(system: str | None = None, skill_dir: str = SKILL_DIR) -> lis
                 "dependency:zstd",
                 "warn",
                 "Long compressed messages cannot be decoded",
-                "Run setup again",
+                f"pip install -r {REQ_REF}",
             )
         )
 
-    if system == "Darwin":
-        sqlcipher = os.environ.get("WECHAT_SQLCIPHER_PATH") or shutil.which("sqlcipher")
+    # 分析层若与数据准备层不在同一棵树，④导出/⑤建库 之后 ⑥ 会找不到库。
+    # 只在「库已建好但分析层不在本树」时才提示 —— 否则会变成天天响的噪声。
+    db_path = os.path.join(skill_dir, "wxlocal", "wxbase.db")
+    analyze_dir = os.path.join(skill_dir, "wxlocal", "analyze")
+    if os.path.exists(db_path) and not os.path.isdir(analyze_dir):
         checks.append(
             Check(
-                "sqlcipher",
-                "ok" if sqlcipher else "fail",
-                sqlcipher or "not found",
-                "Install with Homebrew: brew install sqlcipher" if not sqlcipher else "",
+                "layout",
+                "warn",
+                "wxbase.db 已建，但 wxlocal/analyze/ 不在本树",
+                "把 wechat-corpus-pipeline 的 code/wxlocal/analyze/ 并入本树的 wxlocal/"
+                "（见包 README「组装全链路」段）",
             )
         )
-        key_check = _key_check(
-            os.path.join(skill_dir, "key.txt"),
-            "references/macos.md",
-            check_permissions=os.name != "nt",
-        )
-        checks.append(key_check)
-        data_glob = os.path.expanduser(
-            "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/*/db_storage"
-        )
-        data_dirs = glob.glob(data_glob)
-        checks.append(
-            Check(
-                "database",
-                "ok" if data_dirs else "fail",
-                f"{len(data_dirs)} db_storage director{'y' if len(data_dirs) == 1 else 'ies'} found",
-                "Open and sign in to WeChat" if not data_dirs else "",
-            )
-        )
-        if key_check.status != "fail" and data_dirs:
-            checks.append(_mac_key_database_check(skill_dir, data_dirs))
-        if _has_module("frida"):
-            checks.append(Check("dependency:frida", "ok", "Key extraction dependency available"))
-        else:
-            checks.append(Check("dependency:frida", "warn", "Key extraction dependency missing", "Run setup again"))
-        model_dir = os.path.expanduser(
-            "~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-mlx"
-        )
-        checks.append(
-            Check(
-                "voice-model",
-                "ok" if os.path.isdir(model_dir) else "warn",
-                "cached" if os.path.isdir(model_dir) else "not cached; ordinary export still works",
-                "Download only after user approval (~3 GB)" if not os.path.isdir(model_dir) else "",
-            )
-        )
-        checks.append(_voice_backend_check(system))
-    else:
-        checks.append(
-            _key_check(
-                os.path.join(skill_dir, "key_windows.txt"),
-                "references/windows.md",
-                check_permissions=False,
-            )
-        )
-        decrypted = glob.glob(
-            os.path.join(skill_dir, "decrypted", "**", "message", "message_[0-9].db"),
-            recursive=True,
-        )
-        checks.append(
-            Check(
-                "database",
-                "ok" if decrypted else "fail",
-                f"{len(decrypted)} decrypted message database(s) found",
-                "Run scripts/windows/decrypt_all.py" if not decrypted else "",
-            )
-        )
-        for module, label in (("frida", "frida"), ("Crypto", "pycryptodome")):
-            checks.append(
-                Check(
-                    f"dependency:{label}",
-                    "ok" if _has_module(module) else "warn",
-                    "available" if _has_module(module) else "missing",
-                    "Run setup again" if not _has_module(module) else "",
-                )
-            )
-        hf_cache = (
-            os.path.expanduser(os.environ["HF_HUB_CACHE"])
-            if os.environ.get("HF_HUB_CACHE")
-            else os.path.join(
-                os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface")),
-                "hub",
-            )
-        )
-        model_dir = os.path.join(hf_cache, "models--Systran--faster-whisper-large-v3")
-        checks.append(
-            Check(
-                "voice-model",
-                "ok" if os.path.isdir(model_dir) else "warn",
-                "cached" if os.path.isdir(model_dir) else "not cached; ordinary export still works",
-                "Download only after user approval (~3 GB)" if not os.path.isdir(model_dir) else "",
-            )
-        )
-        checks.append(_voice_backend_check(system))
 
     return checks
 
@@ -334,13 +227,21 @@ def _human(checks: list[Check]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Diagnose a wechat-decrypt installation")
+    parser = argparse.ArgumentParser(
+        description="Diagnose a wechat-corpus-toolkit installation"
+    )
     parser.add_argument("--json", action="store_true", help="Output structured JSON")
     args = parser.parse_args()
     checks = collect_checks()
     ok = not any(item.status == "fail" for item in checks)
     if args.json:
-        print(json.dumps({"ok": ok, "checks": [asdict(item) for item in checks]}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {"ok": ok, "checks": [asdict(item) for item in checks]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
         print(_human(checks))
     return 0 if ok else 1

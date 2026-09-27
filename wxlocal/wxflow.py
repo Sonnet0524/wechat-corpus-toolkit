@@ -557,7 +557,7 @@ def _slugify_group(name, wxid):
     """群名 → 稳定、文件系统安全的 slug（供尚无导出产物的池条目使用）
 
     slug 最终会变成 `exports21/<slug>.json` 的**文件名**，所以只保留 \\w（含 CJK）
-    —— 群名里的 emoji、`丨`、`｜`、括号、空格统统换成 `_`。137 个群名含 emoji，
+    —— 群名里的 emoji、`丨`、`｜`、括号、空格统统换成 `_`。不少群名含 emoji，
     不净化就会写出 `wx_🐼示例创客….json` 这种文件名（shell/打包/跨平台都脆弱）。
     """
     base = re.sub(r"[^\w]+", "_", name or "")[:24].strip("_")
@@ -834,6 +834,7 @@ MENU = [
     ("network3.py",       "none",   "B6/C11", "圈层/传播链/沉默结构",            "network3.py"),
     ("circle_map.py",     "none",   "B6",    "圈层图渲染(PNG)",                  "circle_map.py"),
     ("turn_window.py",    "person", "D4",    "发言块-回合-窗口(svrid 锚扩展)",   'turn_window.py "<人名>" <群关键词> --turn N'),
+    ("dump_turn_windows.py", "person", "D4-prep", "全量回合窗导出(并集去重, 不截断, 供 LLM 逐段读)", 'dump_turn_windows.py "<人名>" <群关键词> <out.md>'),
     ("deep3.py",          "person", "A1/A2/A3", "风格/话题熵/情绪触发",          'deep3.py "<人名>"'),
     ("chat_interaction.py", "person", "D3",  "四维交互(共现/引用/@双向)",        'chat_interaction.py "<人名>"'),
     ("pairs_extract.py",  "person", "D3",    "关系往返对(喂 LLM 关系分型)",      'pairs_extract.py "<人名>"'),
@@ -855,7 +856,7 @@ MENU = [
 BATCHES = {
     "G0": ("图与指纹构建(分析前置)", ["build_graph.py"]),
     "G1": ("群画像批次", ["group_dossier.py", "group_profile.py", "group_matrix.py", "group_overlap.py", "network3.py"]),
-    "P1": ("个人画像批次", ["person_dossier.py", "turn_window.py", "deep3.py", "chat_interaction.py", "pairs_extract.py", "address_thermo.py"]),
+    "P1": ("个人画像批次", ["person_dossier.py", "turn_window.py", "dump_turn_windows.py", "deep3.py", "chat_interaction.py", "pairs_extract.py", "address_thermo.py"]),
     "R1": ("关系引述批次", ["quoted_by.py", "quote_ctx.py", "pairs_extract.py"]),
     "O1": ("观点金句批次", ["opinion_evolve.py", "golden_quote.py"]),
     "S1": ("语义层数据准备批次(候选包, 判断交 LLM)", ["dump_opinions.py", "opinion_fingerprint.py", "consistency_check.py", "verify_entity.py"]),

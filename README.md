@@ -7,7 +7,7 @@
 (SQLCipher)                (scripts/)             (六表)        (wxlocal/analyze)   (云端或本地)   (MD+HTML)
 ```
 
-**数据全程不出本机**。提 key、解密、导出、建库、全部 26 个分析脚本都在本机运行，语料无任何云端上传——若搭配本地 LLM（Ollama / llama.cpp / vLLM）做判读层，可端到端完全离线。
+**数据全程不出本机**。提 key、解密、导出、建库、全部 27 个分析脚本都在本机运行，语料无任何云端上传——若搭配本地 LLM（Ollama / llama.cpp / vLLM）做判读层，可端到端完全离线。
 
 > 本仓库是 [tzwkb/wechat-decrypt](https://github.com/tzwkb/wechat-decrypt) 的下游扩展发行版：以全盘 git 历史继承上游解密/提 key 能力，叠加本项目的导出 → 建库 → 分析完整工具链。MIT 双署名，见 [LICENSE](LICENSE)。
 
@@ -15,20 +15,56 @@
 
 ## 目录
 
+- [⚠️ 数据安全提醒（先读）](#️-数据安全提醒先读)
+- [🔒 安全使用提醒：先审计，再运行](#-安全使用提醒先审计再运行)
 - [它解决什么问题](#它解决什么问题)
 - [方法论：代码备料，LLM 掌勺](#方法论代码备料llm-掌勺)
 - [五个理论支柱](#五个理论支柱)
 - [安装](#安装)
 - [快速开始](#快速开始)
+- [把两半拼成一棵树（重要）](#把两半拼成一棵树重要)
 - [分析批次与工具全景](#分析批次与工具全景)
 - [可以得到的结果](#可以得到的结果)
 - [衍生用法](#衍生用法)
 - [隐私与安全（七原则）](#隐私与安全七原则)
 - [已知环境坑（实测）](#已知环境坑实测)
 - [跟随上游同步](#跟随上游同步)
-- [开源许可与致谢](#开源许可与致谢)
+- [🤖 智能体使用说明（Agent Guide）](#-智能体使用说明agent-guide)
+- [致谢](#致谢)
+- [开源许可](#开源许可)
 
 ---
+
+## ⚠️ 数据安全提醒（先读）
+
+**本工具链会把你的微信聊天记录以明文形式保存在本机磁盘上。**
+
+具体包括：解密后的明文数据库镜像（`decrypted/`，与微信本体库等价的全量明文）、结构化导出语料（`wxlocal/exports21/*.json`）、分析库（`wxlocal/wxbase.db`）。这些文件**不再有任何加密保护**——拿到这台机器文件访问权的任何人、任何程序（包括恶意软件）都能直接读出全部聊天内容。
+
+- 请像对待银行密码一样对待 `decrypted/`、`wxbase.db`、`key_windows.txt` 这三处；
+- 用完建议及时删除明文镜像与分析库（重新解密/建库的成本很低，key 在手即可全量复现）；
+- **如果你的磁盘没有全盘加密（BitLocker），风险更高**——建议先开全盘加密再使用本工具；
+- 云同步盘（OneDrive 等）、共享目录、临时目录都不是安全的存放位置，务必让产物目录脱离任何自动上云路径；
+- 本项目按 MIT 许可"按现状"提供，**不对任何数据遗漏、损坏、泄露承担责任**。你决定使用，即表示你理解并接受上述风险。
+
+## 🔒 安全使用提醒：先审计，再运行
+
+本工具链的核心能力是**读取你全部聊天记录并写入明文文件**——这是极高权限的操作。在运行任何从网上下载的版本（包括本仓库）之前：
+
+1. **做代码审计**。重点读这几处（全部 < 1000 行，一小时能读完）：
+   - `scripts/windows/extract_raw_key.py` —— Frida 注入与 key 提取（外发数据？没有）
+   - `scripts/windows/decrypt_all.py` —— 解密写盘（网络调用？没有）
+   - `wxlocal/export21.py` / `wxlocal/run_batch21.py` —— 读库与写 JSON（上传？没有）
+   - 全局搜 `requests` / `urllib` / `http` / `socket` / `upload` / `POST`——正常结果应为：**零网络外发代码路径**
+2. **验证 git 历史**。本仓库以上游全量历史为基座，扩展层独立成提交，可逐 commit 审：
+   ```bash
+   git log --oneline --stat        # 每个提交改了什么
+   git diff 86dc9a7..main --stat   # 相对上游的全部差异(应只有扩展层+1行decrypt_read修正)
+   ```
+3. **核对关键文件的哈希**。`git diff` 里凡是动了 `scripts/` 下上游文件的提交都要重点看——目前唯一预期改动是 `decrypt_read.py` 的一行输出路径。
+4. **防火墙验证（可选但推荐）**。运行导出/建库时抓一次包，确认无外联。
+
+任何人都可以 fork 后注入恶意代码再分发。**只从本仓库官方地址 clone，并在推送后重新核对 commit hash**。
 
 ## 它解决什么问题
 
@@ -74,7 +110,7 @@
 | 操作系统 | Windows 10/11（提 key 与解密脚本为 Windows 路径） |
 | Python | 3.10+ |
 | 数据准备依赖 | `frida`、`pycryptodome`（requirements-windows.txt） |
-| 分析层依赖 | 仅标准库；`circle_map.py`/`network3.py` 另需 `networkx` + `matplotlib` |
+| 分析层依赖 | 仅标准库；`circle_map.py`/`network3.py` 另需 `networkx` + `matplotlib`（延迟导入，缺了会给出安装提示） |
 | 提 key 硬条件 | 需重启微信一次（Frida race-attach，工具会自动代启动微信，你完成登录即可） |
 | LLM 判读层（可选） | 云端 API 或本地模型（Ollama/llama.cpp/vLLM 跑 Qwen 等）——敏感语料推荐本地模型，完全离线 |
 
@@ -86,6 +122,8 @@ python -m venv .venv
 ```
 
 > ⚠️ **clone 到纯 ASCII 路径**（如 `D:\wechat-corpus-toolkit`）——脱离式守望的计划任务脚本不支持含中文的路径。
+>
+> 💡 非典型环境可零改动迁移：`WX_WEIXIN`（微信 exe 路径）、`WX_WECHAT_ROOT`（xwechat_files 根）、`WX_ACCOUNT`（多账号时指定账号）三个环境变量。
 
 ## 快速开始
 
@@ -130,36 +168,45 @@ export PYTHONUTF8=1
 # ② 群画像：结构数学 + 抽样包（喂 LLM 判内容轴/话语轴）
 .venv/Scripts/python.exe wxlocal/analyze/group_profile.py --sample "<群 slug>" --n 30
 
-# ③ 人物证据卡 / 私聊画像
+# ③ 人物证据卡 / 私聊画像 / 全量回合窗导出
 .venv/Scripts/python.exe wxlocal/analyze/person_dossier.py --group "<群 slug>" --top 5
 .venv/Scripts/python.exe wxlocal/analyze/dm_profile.py --list --top 20
+.venv/Scripts/python.exe wxlocal/analyze/dump_turn_windows.py "<人名>" "<群 slug>" out.md
 
 # ④ 成文：Markdown 留档 + HTML 成品
 .venv/Scripts/python.exe wxlocal/analyze/md_report.py wxlocal/reports/<报告>.md
 ```
 
-### 作为 agent skill 使用
+## 把两半拼成一棵树（重要）
 
-把两份手册复制进你的 agent skill 目录（`code/` 指向本仓库根），之后用自然语言触发（"提取微信 key 并导出群聊"、"做几个群的分析"）：
+两个 skill **各自只带 `wxlocal/` 的一半**：
+
+| skill | 带的部分 |
+|---|---|
+| `wxlocal/`（本仓库根） | 数据准备链：`export21` / `run_batch21` / `build_db21` / `wxflow` / … |
+| `wxlocal/analyze/` | 分析层 27 个脚本 |
+
+分析脚本把库路径解析为 `<analyze>/../wxbase.db`（绝大多数工具**不接受 `--db`**），也就是要求 `wxbase.db` 与 `analyze/` 处在**同一个 `wxlocal/`** 下——**本仓库的布局已经满足**，clone 后按上面"快速开始"跑即可，无需拼接。
+
+只有当你把两个 skill **拆开**装进 agent skill 目录时，才需要拼树：
 
 ```bash
-cp skills/SKILL-data-prep.md        <你的skill目录>/wechat-data-prep/SKILL.md
-cp skills/SKILL-corpus-pipeline.md  <你的skill目录>/wechat-corpus-pipeline/SKILL.md
+# 以 data-prep 的 code/ 为根，把分析层并进去：
+cp -r skills/wechat-corpus-pipeline-code/wxlocal/analyze  <data-prep-code>/wxlocal/
+# 之后：<data-prep-code>/wxlocal/{wxbase.db, analyze/}  ← 分析脚本可直接跑
 ```
 
-- [`skills/SKILL-data-prep.md`](skills/SKILL-data-prep.md) —— 数据准备手册：六阶段详解 + 30 条不变量 + 典型坑表
-- [`skills/SKILL-corpus-pipeline.md`](skills/SKILL-corpus-pipeline.md) —— 分析手册：批次闭环 + 选题成文 + D1–D7 分层对齐
-- [`skills/docs/数据结构说明.md`](skills/docs/数据结构说明.md) —— 三层数据结构逐字段说明
+`bootstrap.py --check` / `doctor.py` 会在「库已建好、但 `analyze/` 不在本树」时给出 `layout` 提示。
 
 ## 分析批次与工具全景
 
-`wxlocal/analyze/` 26 个脚本，按 8 个批次组织（`G0` 是分析前置，必须先跑）：
+`wxlocal/analyze/` 27 个脚本，按 8 个批次组织（`G0` 是分析前置，必须先跑）：
 
 | 批次 | 名称 | 工具 | 产出 |
 |---|---|---|---|
 | `G0` | 前置 | build_graph | reply/cooccur 边 + coref 别名 + 人物指纹 |
 | `G1` | 群画像 | group_dossier / group_profile / group_matrix / group_overlap / network3 | 群定量事实卡 / 结构数学+抽样包 / 个人×群矩阵 / 群族重叠 / 圈层传播链 |
-| `P1` | 个人画像 | person_dossier / turn_window / deep3 / chat_interaction / pairs_extract / address_thermo | 人物证据卡 / 回合窗口 / 风格熵情绪触发 / 四维交互 / 关系往返对 / 称呼温度计 |
+| `P1` | 个人画像 | person_dossier / turn_window / dump_turn_windows / deep3 / chat_interaction / pairs_extract / address_thermo | 人物证据卡 / 回合窗口 / 全量回合窗导出 / 风格熵情绪触发 / 四维交互 / 关系往返对 / 称呼温度计 |
 | `R1` | 关系引述 | quoted_by / quote_ctx / pairs_extract | 被引定位（svrid 精确）/ 引用上下文还原 / 分型原料 |
 | `O1` | 观点金句 | opinion_evolve / golden_quote | 观点演化线（含倒序推演）/ 金句双通道（被引+共鸣） |
 | `S1` | 语义原料 | dump_opinions / opinion_fingerprint / consistency_check / verify_entity | 全量观点候选 / 指纹 / 一致性三轴候选 / 可验实体候选 |
@@ -206,10 +253,11 @@ cp skills/SKILL-corpus-pipeline.md  <你的skill目录>/wechat-corpus-pipeline/S
 | 坑 | 处置 |
 |---|---|
 | 仓库路径含中文/非 ASCII | 计划任务 bat（ASCII 写盘）会乱码 → **clone 到纯 ASCII 路径** |
-| schtasks 日期格式 | 中文系统短日期为 `yyyy/M/d`，美式 `M/d/yyyy` 被拒；已用 `2099/12/31` 规避 |
+| schtasks 日期格式 | 已改走 `/Create /XML`（ISO 日期，区域无关）；命令行回退也按本机格式现场拼 |
 | 计划任务「已排队」但不执行 | 电源判定为电池时默认 `DisallowStartIfOnBatteries` 静默拦截；key_daemon 已自动关闭该限制 |
-| 微信装在非 C 盘 | `wxlocal/key_daemon.py` 的 `WEIXIN` 常量按实际安装路径修改 |
-| Documents 重定向（如 HuaweiMoveData） | 提 key 扫 `C:\Users\*\Documents\xwechat_files`；建目录联接：`mklink /J C:\Users\<你>\Documents\xwechat_files\<account> <真实目录>` |
+| 微信装在非 C 盘 | 运行时自动探测（注册表/各盘/PATH/限深搜索），或设 `WX_WEIXIN` |
+| Documents 重定向（如 HuaweiMoveData） | 运行时自动发现；或设 `WX_WECHAT_ROOT` 指向真实 xwechat_files 目录 |
+| 多账号共存 | 按"最新 db mtime"自动选活跃账号；或 `WX_ACCOUNT=<账号目录名>` 显式指定 |
 | 杀微信后立即代启动 | 撞微信单实例锁，启动即退；等 8–15 秒（key_daemon 的守望已内置该延时） |
 
 更多数据准备侧与分析侧的典型坑（30 条不变量、每条规则的实测来历），见两份 SKILL 手册。
@@ -226,12 +274,96 @@ git merge upstream/main
 
 如遇 `decrypt_read.py` 冲突：以上游版本为准，再重新应用一行修改（`dst = os.path.join(tempfile.gettempdir(), "_dec_msg0.db")`）。
 
-## 开源许可与致谢
+---
 
-本项目基于开源项目 **wechat-decrypt** 构建，谨致谢忱。
+## 🤖 智能体使用说明（Agent Guide）
 
-- **数据准备层**（提 key / 解密 / 数据库访问，即 `scripts/` 与核心读写代码）源自 [tzwkb/wechat-decrypt](https://github.com/tzwkb/wechat-decrypt)（作者 cocofeng），在其基础上做了工程化扩展（导出层 wxexport/2.1、选群勾选、增量导出、建库六表等）。
-- **分析层**（`wxlocal/analyze/` 的 26 个脚本与方法论）为本工具链原创。
+**如果你是 AI 智能体（agent），被用户派来使用本仓库**——按下面的顺序读文档、跑命令。不要跳读。
+
+### 第 0 步：确定你的角色
+
+本工具链分两个职责域，对应两份手册：
+
+- 用户要**提取 key / 解密 / 导出 / 建库 / 选群勾选 / 增量更新** → 读 [`skills/SKILL-data-prep.md`](skills/SKILL-data-prep.md)
+- 用户要**群画像 / 人物证据卡 / 关系 / 观点 / 报告** → 读 [`skills/SKILL-corpus-pipeline.md`](skills/SKILL-corpus-pipeline.md)
+
+两份手册的 frontmatter 都带触发词。**先读手册再动手**——手册里有 30 条不变量和典型坑表，每一条都是实测事故的固化，跳过它们你大概率会重踩。
+
+### 第 1 步：环境自检（只读，无副作用）
+
+```bash
+PYTHONUTF8=1 .venv/Scripts/python.exe scripts/common/doctor.py --json   # 环境/依赖/账号/布局
+PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/bootstrap.py --check      # 六步状态机
+PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py status          # 管线全景
+```
+
+根据 `status` 的缺口决定走哪条路：缺 key → 数据准备 ①；缺镜像 → ②；缺导出 → ④；缺库 → ⑤；都齐了 → 直接分析。
+
+### 第 2 步：数据准备（走 SKILL-data-prep 手册）
+
+硬约束（违反即事故）：
+
+1. 提 key 会**关闭微信**，随后自动代启动；用户需在窗口期内完成登录。提 key 前先告知用户这一点。
+2. 判成功看 `extractor rc==0` **且** 对 `message_0.db` 实测通过，**不是**看"key 指纹是否变化"。
+3. 导出覆盖写 → `--inc`/`--merge` 前先备份；`select` 无过滤条件必须显式 `--all`（否则拒绝执行）。
+4. 涉及用户账号的操作（提 key、全量导出）**先向用户确认范围**，不要自作主张导全量。
+
+### 第 3 步：分析（走 SKILL-corpus-pipeline 手册）
+
+硬约束：
+
+1. **`G0`（build_graph.py）必须先跑**，否则引用网络/共现/指纹全空。
+2. **代码只做 D1–D4，D5–D7 语义判断由你（LLM）承担**。工具输出是结构数学/候选包/抽样包/证据卡——你的职责是**逐条读原文**后下判断，绝不把工具的结构输出当结论复述。
+3. **绝不"聚类+抽样+截断"代替全量阅读**：候选包出全后逐条读；曾两次因 `head` 截断把确实存在的原话判成"检索不到"。
+4. 人名用花名册全名（精确匹配）；群 slug 用 `wxflow.py rooms` 查到的 `〔〕` 内名称。
+5. 未验真的信息强制标 `[未验]`；报告里的每条断言必须能溯源到消息级。
+6. 工作群语料（含真实同事姓名）**外发前必须脱敏**——输出给用户看可以，输出到任何外部渠道前必须 hash 化。
+
+### 第 4 步：产物与交付
+
+- 报告落 `wxlocal/reports/`（Markdown 留档 + `md_report.py` 渲染同名 HTML，**两份都要有**）；
+- 编号体系：群 `WX-GROUP-XXX` / 人物 `WX-PERSON-XXX` / 跨群 KOL `WX-KOL-XXX` / 语义层 `WX-SEM-XXX`；
+- 工具原始输出（判读素材）落 `wxlocal/reports/_sem_raw/`，不要塞进报告正文。
+
+### 智能体速查
+
+```bash
+# 我该干什么? —— 状态机告诉你
+PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py status
+# 有哪些群可分析? —— 选题
+PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py rooms --recent 90
+# 27 个工具全菜单 / 某批次展开
+PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py menu --batches
+PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py menu --batch P1
+# 增量: 库落后多少?
+PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py delta
+```
+
+### 仓库结构与文档地图
+
+```
+wechat-corpus-toolkit/
+├── README.md                     ← 本文件(人类+智能体入口)
+├── skills/
+│   ├── SKILL-data-prep.md        ← 智能体必读: 数据准备手册(六阶段+30不变量+坑表)
+│   ├── SKILL-corpus-pipeline.md  ← 智能体必读: 分析手册(批次+闭环+D1-D7)
+│   └── docs/                     ← 数据结构说明 / wxexport/2.1 规范 / 融合分析
+├── scripts/                      ← 上游层: 提key/解密/诊断/查询(macos|windows|common)
+├── wxlocal/                      ← 扩展层: 导出/建库/状态机/守望(key_daemon)
+│   └── analyze/                  ← 27 个分析脚本
+├── tests/ e2e/                   ← 上游测试(改上游层后应跑)
+└── docs/upstream-README_ZH.md    ← 上游原 README 存档
+```
+
+---
+
+## 致谢
+
+本项目的数据准备层（提 key / 解密 / 数据库访问，即 `scripts/` 与核心读写代码）完全建立在开源项目 **wechat-decrypt** 之上——没有上游作者的 Windows 提 key 攻关（Frida race-attach 读 SHA-512 ipad 块还原 raw key）、SQLCipher 逐页解密实现和整套工程化底座，这个工具链无从谈起。
+
+**特别感谢 [cocofeng / tzwkb](https://github.com/tzwkb/wechat-decrypt) 的开源贡献。** 本仓库以上游全量 git 历史为基座，最大限度保留上游的提交脉络与作者归属；上游层代码版权归 cocofeng，扩展层（导出/建库/分析）版权归本工具链贡献者。如果你觉得本项目有用，也请给[上游仓库](https://github.com/tzwkb/wechat-decrypt)一个 star。
+
+## 开源许可
 
 MIT 双署名（见 [LICENSE](LICENSE)）：
 
@@ -240,4 +372,4 @@ Copyright (c) 2026 cocofeng        (wechat-decrypt, https://github.com/tzwkb/wec
 Copyright (c) 2026 wechat-corpus-toolkit contributors
 ```
 
-再分发本工具链（整体或部分）时，请连同 LICENSE 一并保留。仅对你拥有或已获授权访问的本地数据使用；遵守当地法律法规及微信/腾讯服务条款。
+再分发本工具链（整体或部分）时，请连同 LICENSE 一并保留。仅对你拥有或已获授权访问的本地数据使用；遵守当地法律法规及微信/腾讯服务条款。本软件按"现状"提供，不附带任何担保——详见数据安全提醒一节。

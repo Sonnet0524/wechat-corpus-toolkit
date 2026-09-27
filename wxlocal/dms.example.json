@@ -1,0 +1,32 @@
+[
+  {
+    "slug": "wx_dm_example001",
+    "kw": "wxid_example001",
+    "wxid": "wxid_example001",
+    "kind": "private",
+    "name": "示例私聊对象A",
+    "days_ago": 0.0,
+    "last_active": "2026-01-01 00:00",
+    "twin_me": false,
+    "exported": false,
+    "n_msgs": 0,
+    "empty": false,
+    "window_days": null,
+    "on": true
+  },
+  {
+    "slug": "wx_dm_example002",
+    "kw": "wxid_example002",
+    "wxid": "wxid_example002",
+    "kind": "private",
+    "name": "示例私聊对象B",
+    "days_ago": 0.0,
+    "last_active": "2026-01-01 00:00",
+    "twin_me": false,
+    "exported": false,
+    "n_msgs": 0,
+    "empty": false,
+    "window_days": null,
+    "on": false
+  }
+]

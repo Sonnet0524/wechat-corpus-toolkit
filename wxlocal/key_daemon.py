@@ -13,9 +13,19 @@
 做法
 ----
 守望与重启都交给 Windows 计划任务(schtasks): 任务由 Task Scheduler 服务拉起,
-天然脱离当前命令的作业对象 → 命令退出后守望仍然活着。任务用
-`/SC ONCE + /SD <远期日期> + /Run` 立即执行一次, 该日期永不命中 →
-不会出现"当晚 23:59 又拉一次微信"的残留副作用; 任务在收尾时删除。
+天然脱离当前命令的作业对象 → 命令退出后守望仍然活着。任务是一次性的
+"远期触发 + 立即 /Run": 该时刻永不命中 → 不会出现"当晚 23:59 又拉一次微信"的
+残留副作用; 任务在收尾时删除。
+
+建任务优先走 **XML**(`/Create /XML`) 而不是命令行 `/TR ... /SD`，因为踩过两个真 bug:
+  · **BUG-1 日期格式**: `/SD` 只认**本机短日期格式**。写死美式 `12/31/2099` 在中文
+    (zh-CN) 系统被 schtasks **拒绝** → 任务建不起来, 守望根本没启动。XML 用 ISO
+    `2099-12-31T23:59:00`, 与区域设置无关(回退路径也改为按本机格式现场拼)。
+  · **BUG-2 电池限制**: 命令行**没有**电池开关, 而 schtasks 默认
+    `DisallowStartIfOnBatteries=true` / `StopIfGoingOnBatteries=true` —— 笔记本上若电源被
+    判定为"用电池", 任务会**静默不执行**，可从建到跑全程报成功, 现象只有"守望像没起来"。
+    XML 里显式置 false, 并在建完后**回读校验**(`sched_battery_disallowed`)。
+    这两个 bug 都在作者机器(英文区域 + 台式机)上不暴露 —— 换台中文笔记本立刻复现。
 
 子命令
 ------
@@ -54,6 +64,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -62,20 +73,210 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(ROOT))            # 让 wxlocal/ 下的脚本能 import 仓库根的 config
+import config as wconfig                 # noqa: E402  (补好 sys.path 再导)
 KEY = ROOT / "key_windows.txt"
 EVENT = HERE / ".key_event.json"
 LOG = HERE / ".key_daemon.log"
 EXTRACTOR = ROOT / "scripts" / "windows" / "extract_raw_key.py"
-WEIXIN = Path(r"D:\Program Files\Tencent\Weixin\Weixin.exe")
 
 TASK_WX, TASK_WD, TASK_ST = "wxl_weixin", "wxl_watchdog", "wxl_selftest"
 BAT_WX, BAT_WD, BAT_ST = HERE / ".task_weixin.cmd", HERE / ".task_watch.cmd", HERE / ".task_selftest.cmd"
-FAR_DATE = "2099/12/31"          # ONCE 的启动日期: 永不命中, 消除 23:59 残留
-                                 # (本机 sShortDate=yyyy/M/d, 美式 12/31/2099 会被拒)
+FAR_ISO = "2099-12-31T23:59:00"  # XML 用: ISO 格式, 与区域设置无关; 永不命中 → 无日历残留
+FAR_YMD = (2099, 12, 31)         # 回退路径用: 日期按**本机短日期格式**现场拼（见 _locale_short_date）
 MAIN_MEM_KIB = 20 * 1024         # 主进程判据(与 extractor 的 parse_main_pid 一致)
 LAUNCH_DELAY = 3.0               # 见到重启提示后等 extractor 收尾, 再代启动
 LAUNCH_CONFIRM_S = 30            # 代启动后等主进程出现的上限
 SETTLE_S = 6                     # 拿到 key 后等 Frida detach 效应显现再判微信存活
+
+
+# ─────────────────── 微信主程序定位(可迁移: 不写死盘符/安装目录) ───────────────────
+
+_WEIXIN_CACHE: dict = {}
+
+
+def weixin_exe():
+    """微信主程序路径。返回 ``(Path | None, tried: list[str])``。
+
+    曾经这里写死 ``C:\\Program Files\\Tencent\\Weixin\\Weixin.exe`` —— 装在别的盘
+    或自定义目录就找不到。现改为运行时探测（环境变量 → 注册表 InstallPath →
+    各盘常见目录 → PATH → 限深兜底搜索），见 ``config.find_weixin_exe()``。
+    也支持用 ``WX_WEIXIN`` 环境变量直接指定。
+    """
+    if "v" not in _WEIXIN_CACHE:
+        p, tried = wconfig.find_weixin_exe()
+        _WEIXIN_CACHE["v"] = (Path(p) if p else None, tried)
+    return _WEIXIN_CACHE["v"]
+
+
+def _weixin_hint(tried) -> str:
+    """找不到微信时给用户的提示（列出试过的位置 + 如何显式指定）。"""
+    head = "；".join(str(t) for t in tried[:4]) if tried else "（无候选）"
+    return (f"试过: {head} …\n"
+            f"  请用环境变量显式指定后重试:  set {wconfig.ENV_WEIXIN}=D:\\路径\\Weixin.exe\n"
+            f"  （若微信装在受限目录而扫描被拒，请以管理员身份运行一次以完成定位）")
+
+
+def _bat_bytes(body: str) -> bytes:
+    """把 .cmd 正文编码为 cmd.exe 会按『系统 ANSI 代码页』解读的字节。
+
+    ⚠ 曾经的坑（真 bug）：原实现用 ``encoding="ascii", errors="replace"`` 写 ——
+    仓库路径含**中文**时（例如 ``D:\\示例中文目录\\wechat-decrypt``）路径被写成 ``?``，
+    计划任务以 ANSI(GBK) 代码页执行时既找不到脚本、也写不出 marker → ``rc=1``。
+    作者机器上仓库在 ``C:\\wechat-decrypt``（纯 ASCII），所以这个坑一直没暴露。
+    现改用 ``mbcs``（= 当前系统 ANSI 代码页，中文 Windows 上就是 GBK），与 cmd.exe 一致。
+    """
+    text = "@echo off\r\n" + body.rstrip() + "\r\n"
+    try:
+        return text.encode("mbcs", errors="replace")
+    except LookupError:                  # 非 Windows / 无 ANSI 代码页
+        return text.encode("utf-8", errors="replace")
+
+
+def _short_path(p) -> str:
+    """尽量取 8.3 短路径（ASCII 更安全），用于 schtasks 的 ``/TR``。
+
+    schtasks 在部分版本仍走 ANSI 层，非 ASCII 路径可能被写坏；取不到短路径时
+    原样返回（不改变原有行为）。
+    """
+    if not wconfig.IS_WINDOWS:
+        return str(p)
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(2048)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(p), buf, 2048)
+        if n and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return str(p)
+
+
+def _script_invocation() -> str:
+    """构造 .cmd 里「解释器 + 本脚本」的调用前缀（可迁移）。
+
+    · 解释器尽量取 8.3 短路径 → 纯 ASCII（解释器可能装在含中文的用户目录下）；
+    · 脚本用 ``%~dp0``（.cmd 与本脚本同目录）引用 → **不把仓库路径写进 .cmd**，
+      这样仓库路径含中文/emoji 也不影响（.cmd 正文保持 ASCII，绕开 ANSI 代码页）。
+
+    两处合起来：.cmd 正文与 /TR 都只剩 ASCII，计划任务在任何代码页下都跑得起来。
+    """
+    return f'"{_short_path(sys.executable)}" "%~dp0{Path(__file__).name}"'
+
+
+# ─────────────── 计划任务: 远期日期 / 电池限制（两个真 bug 的修复） ───────────────
+
+_ENC = {"v": None}
+
+
+def _batch_stdout_encoding() -> str:
+    """schtasks 等控制台程序输出的编码（= 系统 ANSI 代码页）。"""
+    if _ENC["v"] is None:
+        try:
+            _ENC["v"] = "mbcs"
+            "".encode(_ENC["v"])
+        except LookupError:
+            _ENC["v"] = "utf-8"
+    return _ENC["v"]
+
+
+_MON = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _locale_short_date(y: int, m: int, d: int) -> str:
+    """把日期拼成**本机短日期格式**（``schtasks /SD`` 只认本机格式）。
+
+    ⚠ 坑（真 bug #1）：原实现写死美式 ``12/31/2099``。中文(zh-CN) Windows 的短日期是
+    ``yyyy/M/d``，schtasks 直接**拒绝**该日期 → ``/Create`` 失败，守望根本没建起来。
+    作者机器是英文/美式区域，所以没暴露。此处查 ``LOCALE_SSHORTDATE`` 动态拼，
+    任何区域（en-US ``12/31/2099``、zh-CN ``2099/12/31``、de-DE ``31.12.2099``…）都对。
+    """
+    if not wconfig.IS_WINDOWS:
+        return f"{y:04d}/{m:02d}/{d:02d}"
+    try:
+        import ctypes
+
+        pat = ctypes.create_unicode_buffer(128)
+        if not ctypes.windll.kernel32.GetLocaleInfoW(0x400, 0x1F, pat, 128):
+            raise OSError("LOCALE_SSHORTDATE unavailable")
+        sep = ctypes.create_unicode_buffer(16)
+        if not ctypes.windll.kernel32.GetLocaleInfoW(0x400, 0x1D, sep, 16):
+            sep.value = "/"
+        out = pat.value
+        # 顺序要紧: 长 token 先替, 否则 yyyy→yy 会把 4 位数截断, MM→M 同理
+        out = out.replace("yyyy", f"{y:04d}").replace("yy", f"{y % 100:02d}")
+        out = (out.replace("MMMM", _MON[m - 1]).replace("MMM", _MON[m - 1])
+                  .replace("MM", f"{m:02d}").replace("M", str(m)))
+        out = out.replace("dd", f"{d:02d}").replace("d", str(d))
+        if any(c.isalpha() for c in out):        # 出现没处理的字母 token → 不敢用
+            raise ValueError(f"unparsed date pattern: {pat.value}")
+        return out.replace("/", (sep.value or "/"))
+    except Exception:
+        return f"{y:04d}/{m:02d}/{d:02d}"        # 兜底: ISO 风格, 至少中文/多数区域可读
+
+
+def _task_xml(bat_path) -> str:
+    """生成「单次 + 远期 + 不受电池限制 + 当前用户会话」的任务 XML。
+
+    为什么不用 ``schtasks /Create /TR ... /SD``:
+    · ``/SD`` 只认本机短日期格式 → 见 ``_locale_short_date`` 的坑 #1；
+    · **命令行没有任何电池开关**，而 schtasks 默认
+      ``DisallowStartIfOnBatteries=true`` / ``StopIfGoingOnBatteries=true`` ——
+      笔记本上若电源被判定为"用电池"，任务会**静默不执行**，但建任务/触发全都报成功，
+      现象就是"守望像没起来一样"（最隐蔽的坑 #2）。XML 里显式置 false。
+    · ``LogonType=InteractiveToken`` → 计划任务在当前**交互会话**里跑（代启动微信
+      必须有桌面会话，否则又是一个"空壳微信"）。
+    """
+    user = os.environ.get("USERNAME") or ""
+    domain = os.environ.get("USERDOMAIN") or ""
+    who = f"{domain}\\{user}" if (domain and user) else (user or ".")
+    cmd = _short_path(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                   "System32", "cmd.exe"))
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <RegistrationInfo>\n"
+        "    <Description>wechat-corpus-toolkit detached runner (transient; deleted on finish)"
+        "</Description>\n"
+        "  </RegistrationInfo>\n"
+        "  <Triggers>\n"
+        "    <TimeTrigger>\n"
+        f"      <StartBoundary>{FAR_ISO}</StartBoundary>\n"
+        "      <Enabled>true</Enabled>\n"
+        "    </TimeTrigger>\n"
+        "  </Triggers>\n"
+        "  <Principals>\n"
+        '    <Principal id="Author">\n'
+        f"      <UserId>{who}</UserId>\n"
+        "      <LogonType>InteractiveToken</LogonType>\n"
+        "      <RunLevel>LeastPrivilege</RunLevel>\n"
+        "    </Principal>\n"
+        "  </Principals>\n"
+        "  <Settings>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <!-- 坑 #2: 必须显式关掉电池限制, 否则笔记本上静默不执行 -->\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <AllowHardTerminate>true</AllowHardTerminate>\n"
+        "    <StartWhenAvailable>false</StartWhenAvailable>\n"
+        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n"
+        "    <AllowStartOnDemand>true</AllowStartOnDemand>\n"
+        "    <Enabled>true</Enabled>\n"
+        "    <Hidden>false</Hidden>\n"
+        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n"
+        "    <WakeToRun>false</WakeToRun>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "    <Priority>7</Priority>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n'
+        "    <Exec>\n"
+        f"      <Command>{cmd}</Command>\n"
+        f'      <Arguments>/c "{_short_path(bat_path)}"</Arguments>\n'
+        "    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n"
+    )
 
 
 # ─────────────────────── 进程 / key 观测 ───────────────────────
@@ -138,8 +339,12 @@ def _sch(args):
     """调用 schtasks。返回 (rc, output); 返回 (None, err) 表示环境不可用——
     例如被安全策略/程序黑名单拦截(PermissionError), 或系统无 schtasks。"""
     try:
-        r = subprocess.run(["schtasks"] + args, capture_output=True, text=True, errors="replace")
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
+        r = subprocess.run(["schtasks"] + args, capture_output=True, text=False)
+        # schtasks 的输出是**系统 ANSI 代码页**（中文=GBK）；用 text=True 且解释器是 UTF-8
+        # 模式时会把中文报错解成乱码 → 显式按 ANSI 解。
+        blobs = [b for b in (r.stdout, r.stderr) if b]
+        text = b"".join(blobs).decode(_batch_stdout_encoding(), errors="replace")
+        return r.returncode, text
     except (PermissionError, OSError) as e:
         return None, str(e)
 
@@ -147,40 +352,76 @@ def _sch(args):
 _SCHED_WARNED = {"v": False}
 
 
+def _warn_sched_unavailable(detail):
+    if not _SCHED_WARNED["v"]:
+        _SCHED_WARNED["v"] = True
+        print("[sched] ⚠ schtasks 不可用(被安全策略拦截或系统缺失) → 脱离式能力降级:")
+        print(f"[sched]   {(detail or '').strip()[:300]}")
+
+
 def sched_create(task, bat_path, body):
-    """写 .cmd → 建 ONCE 任务(远期日期) → 立即 /Run。
-    返回 True=已提交; None=schtasks 不可用(调用方须降级); False=建/跑失败"""
+    """写 .cmd → 建任务(单次/远期/不受电池限制) → 立即 /Run。
+
+    返回 True=已提交; None=schtasks 不可用(调用方须降级); False=建/跑失败。
+
+    两条建任务路径（都修了 BUG-1/BUG-2）:
+      ① **XML**（首选）: ``StartBoundary`` 用 ISO → 与区域设置无关；
+         显式 ``DisallowStartIfOnBatteries=false`` → 笔记本上不会静默不执行；
+         ``LogonType=InteractiveToken`` → 在交互会话里跑（代启动微信必需）。
+      ② **命令行**（回退，XML 不被支持时）: ``/SD`` 用**本机短日期格式**现场拼
+         （不再是写死的美式 "12/31/2099" —— 那在中文系统上会被 schtasks 拒绝）。
+    """
     try:
-        bat_path.write_text("@echo off\r\n" + body.rstrip() + "\r\n", encoding="ascii", errors="replace")
+        # ⚠ 必须按**系统 ANSI 代码页**写（见 _bat_bytes 的坑说明）；且正文里不要内嵌仓库
+        #   路径（用 %~dp0 引用同目录文件）—— 否则仓库路径含中文时计划任务会跑不起来。
+        bat_path.write_bytes(_bat_bytes(body))
     except OSError as e:
         print(f"[sched] 写 {bat_path.name} 失败: {e}")
         return False
-    rc, out = _sch(["/Create", "/TN", task, "/TR", f'"{bat_path}"',
-                    "/SC", "ONCE", "/ST", "23:59", "/SD", FAR_DATE, "/F"])
-    if rc is None:
-        if not _SCHED_WARNED["v"]:
-            _SCHED_WARNED["v"] = True
-            print("[sched] ⚠ schtasks 不可用(被安全策略拦截或系统缺失) → 脱离式能力降级:")
-            print(f"[sched]   {out}")
-        return None
-    if rc != 0:
-        print(f"[sched] 建任务 {task} 失败: {out.strip()}")
-        return False
-    # 电池限制兜底: 部分机器(电源判定为"用电池"/如台式机接 UPS)上,
-    # 默认 DisallowStartIfOnBatteries=true 会让 /Run 静默拒绝启动
-    # (状态"已排队"+ Last Result 0 但动作不执行)。建完即关掉这两个开关。
-    _sch(["/Change", "/TN", task, "/ALLOWSTARTIFONBATTERIES"])
+
+    xml_path = bat_path.with_suffix(".xml")
+    xml_rc, xml_out = 0, ""
     try:
-        import subprocess as _sp
-        _ps = (f"$t = Get-ScheduledTask -TaskName '{task}'; "
-               "$t.Settings.DisallowStartIfOnBatteries = $false; "
-               "$t.Settings.StopIfGoingOnBatteries = $false; "
-               "Set-ScheduledTask -InputObject $t | Out-Null")
-        _sp.run(["powershell", "-NoProfile", "-Command", _ps],
-                capture_output=True, timeout=30)
-    except Exception:
-        pass
-    return sched_run(task)
+        # utf-16 自带 BOM: 任务 XML 的规范编码, 顺带绕开 ANSI 代码页
+        xml_path.write_text(_task_xml(bat_path), encoding="utf-16")
+        xml_rc, xml_out = _sch(["/Create", "/TN", task, "/XML", str(xml_path), "/F"])
+    except OSError as e:
+        xml_rc, xml_out = 1, f"写 {xml_path.name} 失败: {e}"
+    finally:
+        try:
+            xml_path.unlink()
+        except OSError:
+            pass
+
+    if xml_rc is None:                     # schtasks 本身不可用 → 直接降级
+        _warn_sched_unavailable(xml_out)
+        return None
+    if xml_rc != 0:                        # XML 路径不通 → 回退命令行（含本机短日期）
+        print(f"[sched] XML 建任务失败, 回退命令行方式: {(xml_out or '').strip()[:200]}")
+        rc, out = _sch(["/Create", "/TN", task, "/TR", f'"{_short_path(bat_path)}"',
+                        "/SC", "ONCE", "/ST", "23:59",
+                        "/SD", _locale_short_date(*FAR_YMD), "/F"])
+        if rc is None:
+            _warn_sched_unavailable(out)
+            return None
+        if rc != 0:
+            print(f"[sched] 建任务 {task} 失败: {(out or '').strip()}")
+            print("[sched]   若因日期格式被拒: 本机短日期为 "
+                  f"{_locale_short_date(*FAR_YMD)!r}（应匹配系统区域设置）")
+            return False
+    ok = sched_run(task)
+    if ok:
+        _check_battery(task)
+    return ok
+
+
+def _check_battery(task):
+    """回读确认任务不受电池限制（BUG-2）：受限制时笔记本上会静默不执行。"""
+    if sched_battery_disallowed(task) is True:
+        print("[sched] ⚠ 任务仍受电池限制(DisallowStartIfOnBatteries=true) → 笔记本上"
+              "可能**静默不执行**（schtasks 全程报成功，最难排查）。已用 XML 显式关闭；"
+              "若此处仍为 true，请在「任务计划程序」里手动取消"
+              "『只有在计算机使用交流电源时才启动此任务』。")
 
 
 def sched_run(task):
@@ -191,6 +432,33 @@ def sched_run(task):
         print(f"[sched] 运行任务 {task} 失败: {out.strip()}")
         return False
     return True
+
+
+def _sch_bytes(args):
+    """同 _sch, 但返回原始字节（读回 XML 用: 可能是 UTF-16）。"""
+    try:
+        r = subprocess.run(["schtasks"] + args, capture_output=True)
+        return r.returncode, (r.stdout or b"") + (r.stderr or b"")
+    except (PermissionError, OSError) as e:
+        return None, str(e).encode("utf-8", "replace")
+
+
+def sched_battery_disallowed(task):
+    """回读任务的 ``DisallowStartIfOnBatteries`` → True/False；读不到返回 None。
+
+    BUG-2 的**回读校验**：建完任务必须确认该项是 ``false`` —— 否则笔记本上任务会
+    **静默不执行**，而 schtasks 从建到跑全程报成功，现象只有"守望好像根本没起来"。
+    """
+    rc, raw = _sch_bytes(["/Query", "/TN", task, "/XML"])
+    if rc != 0 or not raw:
+        return None
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16", errors="replace")
+    else:
+        text = raw.decode(_batch_stdout_encoding(), errors="replace")
+    m = re.search(r"<DisallowStartIfOnBatteries>\s*(true|false)\s*</DisallowStartIfOnBatteries>",
+                  text, re.I)
+    return None if not m else (m.group(1).lower() == "true")
 
 
 def sched_clean(task):
@@ -204,17 +472,19 @@ def cmd_launch(a):
     if weixin_alive():
         print("[launch] 微信已在运行, 跳过")
         return 0
-    if not WEIXIN.exists():
-        print(f"[launch] ✗ 找不到微信: {WEIXIN} (按实际安装路径改 WEIXIN)")
+    wx, tried = weixin_exe()
+    if wx is None:
+        print("[launch] ✗ 未能定位微信主程序（运行时探测，不写死盘符/安装目录）")
+        print("  " + _weixin_hint(tried))
         return 1
-    print(f"[launch] 启动微信: {WEIXIN}")
-    ok = sched_create(TASK_WX, BAT_WX, f'start "" "{WEIXIN}"')
+    print(f"[launch] 启动微信: {wx}")
+    ok = sched_create(TASK_WX, BAT_WX, f'start "" "{_short_path(wx)}"')
     if ok is None:
         print("[launch] 降级: 改用 ShellExecute 直接启动。")
         print("[launch] ⚠ 代价: 微信成为本进程的子进程, 父进程退出时可能被作业对象一并回收")
         print("[launch]   (你自己的终端里无此问题; agent/CI 沙箱里有)。")
         try:
-            os.startfile(str(WEIXIN))
+            os.startfile(str(wx))
         except OSError as e:
             print(f"[launch] ✗ ShellExecute 失败: {e}")
             return 1
@@ -225,7 +495,7 @@ def cmd_launch(a):
             return 0
         time.sleep(2)
     sched_clean(TASK_WX)
-    print(f"[launch] ✗ 120s 未见微信主进程(submitted={ok}); 检查 WEIXIN 路径 / 单实例锁")
+    print(f"[launch] ✗ 120s 未见微信主进程(submitted={ok}); 检查微信安装路径 / 单实例锁")
     return 1
 
 
@@ -264,12 +534,14 @@ def auto_launch_weixin(out):
     if weixin_main_pid():
         out("[watch] 微信已在运行(可能已手动双击), 跳过代启动")
         return True
-    if not WEIXIN.exists():
-        out(f"[watch] ✗ 找不到微信: {WEIXIN} → 请桌面双击")
+    wx, tried = weixin_exe()
+    if wx is None:
+        out("[watch] ✗ 未定位到微信主程序 → 请手动桌面双击微信图标")
+        out("  " + _weixin_hint(tried).replace("\n", "\n  "))
         return False
     try:
-        os.startfile(str(WEIXIN))
-        out(f"[watch] 已代启动微信: {WEIXIN}")
+        os.startfile(str(wx))
+        out(f"[watch] 已代启动微信: {wx}")
     except OSError as e:
         out(f"[watch] ✗ 代启动失败: {e} → 请桌面双击微信")
         return False
@@ -383,7 +655,7 @@ def cmd_start(a):
     if not a.no_extract and not weixin_alive():
         print("[start] ⚠ 微信当前未运行。extractor 需要先有一个'已登录'的微信,")
         print("        否则杀掉再重启时无法在 90s 内完成登录。建议先 launch 并登录。")
-    body = (f'"{sys.executable}" "{Path(__file__).resolve()}" watch --detached '
+    body = (f'{_script_invocation()} watch --detached '
             f'--timeout {a.timeout} --extract-seconds {a.extract_seconds}'
             + (" --no-extract" if a.no_extract else "")
             + ("" if a.auto_launch else " --no-auto-launch")
@@ -429,7 +701,8 @@ def cmd_selftest(a):
             p.unlink()
         except OSError:
             pass
-    body = f'echo ok > "{marker}"'
+    # 用 %~dp0 引用同目录的 marker → 正文不含仓库路径（含中文也能跑）；见 _bat_bytes 说明
+    body = f'echo ok > "%~dp0{marker.name}"'
     submitted = sched_create(TASK_ST, BAT_ST, body)
     if submitted is None:
         sched_clean(TASK_ST)
@@ -447,6 +720,7 @@ def cmd_selftest(a):
             break
         time.sleep(0.5)
     got = marker.read_text(encoding="ascii", errors="replace").strip() if marker.exists() else ""
+    batt = sched_battery_disallowed(TASK_ST)            # 必须在 sched_clean 之前回读
     sched_clean(TASK_ST)
     for p in (BAT_ST, marker):
         try:
@@ -454,8 +728,15 @@ def cmd_selftest(a):
         except OSError:
             pass
     ok = submitted and got == "ok"
-    print(json.dumps({"sched_submitted": submitted, "detached_wrote_marker": got == "ok",
-                      "rc": 0 if ok else 1}, ensure_ascii=False))
+    out = {"sched_submitted": submitted, "detached_wrote_marker": got == "ok",
+           "battery_restricted": batt, "far_date": _locale_short_date(*FAR_YMD),
+           "rc": 0 if ok else 1}
+    if not ok and submitted:
+        out["hint"] = ("任务已提交但没写出 marker → 常见原因: "
+                       "① 任务受电池限制被静默跳过(见 battery_restricted); "
+                       "② 被安全软件/组策略拦; "
+                       "③ .cmd 的编码与代码页不匹配(仓库路径含中文时, 用非 ANSI 代码页写会乱码)")
+    print(json.dumps(out, ensure_ascii=False))
     return 0 if ok else 1
 
 

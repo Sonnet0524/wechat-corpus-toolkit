@@ -3,12 +3,37 @@
 import hashlib, hmac, os, glob, struct, sys
 
 PAGE_SZ, SALT_SZ, KEY_SZ = 4096, 16, 32
-_bases = glob.glob(os.path.expanduser(
-    "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/"
-    "xwechat_files/*/db_storage"
-))
-BASE = _bases[0] if _bases else ""
-KEY_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "key.txt")
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+KEY_FILE = os.path.join(SKILL_DIR, "key.txt")
+
+
+def candidate_bases():
+    """候选 ``db_storage`` 目录（可迁移：不写死 macOS 容器路径）。
+
+    优先复用仓库根 ``config.data_globs()``（环境变量 → 注册表 → 各盘 → 主目录）；
+    config 不可用时退回 macOS 容器 + 主目录候选。
+    """
+    bases = []
+    try:
+        if SKILL_DIR not in sys.path:
+            sys.path.insert(0, SKILL_DIR)
+        import config as _cfg
+        for g in _cfg.data_globs():
+            bases += glob.glob(g)
+    except Exception:
+        pass
+    if not bases:
+        bases += glob.glob(os.path.expanduser(
+            "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/"
+            "xwechat_files/*/db_storage"
+        ))
+        home = os.path.expanduser("~")
+        bases += glob.glob(os.path.join(home, "Documents", "xwechat_files", "*", "db_storage"))
+        bases += glob.glob(os.path.join(home, "xwechat_files", "*", "db_storage"))
+    return list(dict.fromkeys(b for b in bases if os.path.isdir(b)))
+
+
+BASE = (candidate_bases() or [""])[0]
 
 def verify_enc_key(enc_key, db_page1):
     salt = db_page1[:SALT_SZ]
@@ -32,7 +57,11 @@ def main():
 
     raw_key = bytes.fromhex(raw_hex)
 
-    dbs = glob.glob(f"{BASE}/**/*.db", recursive=True)
+    if not BASE:
+        print("ERR: 未找到任何 db_storage；设 WX_WECHAT_ROOT=<xwechat_files 路径> 后重跑。")
+        sys.exit(2)
+    print(f"Scope: {BASE}")
+    dbs = glob.glob(os.path.join(BASE, "**", "*.db"), recursive=True)
     ok, fail = 0, 0
     for db_path in dbs:
         with open(db_path, "rb") as f:

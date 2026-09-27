@@ -13,7 +13,18 @@
 会话类型: chat_type = group(群, 分母=全体成员) | private(私聊, 分母=对手方1人)。
 既有库通过 migrate() 自动 ALTER 补列; --rebuild 则整库重建。
 默认幂等: 先清空数据表再重灌(重复运行不会翻倍); --append 保留旧行(特殊场景)。
+
+用法
+----
+  python wxlocal/build_db21.py              # 幂等重灌（默认，安全）
+  python wxlocal/build_db21.py --rebuild    # 删库重建（最彻底）
+  python wxlocal/build_db21.py --append      # 保留旧行（特殊场景，会翻倍，慎用）
+
+⚠ 以前这个脚本**没有 argparse**：`--help` / 任何拼错的参数都会被当成"正常运行"，
+于是 `--help` 会**直接清空六张表再重灌**（真 bug #4，很危险）。现改为标准 argparse：
+未知参数报错退出、不改库；`-h/--help` 只打印帮助。
 """
+import argparse
 import os, sys, json, sqlite3, hashlib, re, glob
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -392,5 +403,21 @@ def main(rebuild=False, append=False):
     print(f"\n库: {DB_PATH}")
 
 
+def build_argparser():
+    """显式 CLI —— 见模块 docstring 的 bug #4：没有 argparse 时 `--help` 会直接清库重灌。"""
+    ap = argparse.ArgumentParser(
+        prog="build_db21.py",
+        description="wxexport/2.1 exports → 本地 wxbase.db（六表）。默认幂等重灌。",
+        epilog="默认(无参数)会先清空六张数据表再重灌；--rebuild 连库文件一起重建。",
+    )
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--rebuild", action="store_true",
+                   help="删除 wxbase.db 后整库重建（最彻底；会丢失库内手工数据）")
+    g.add_argument("--append", action="store_true",
+                   help="保留旧行不清理（特殊场景；重复运行会让条数翻倍，慎用）")
+    return ap
+
+
 if __name__ == "__main__":
-    main(rebuild="--rebuild" in sys.argv, append="--append" in sys.argv)
+    _a = build_argparser().parse_args()      # 未知参数/`--help` 到此为止，不会动库
+    main(rebuild=_a.rebuild, append=_a.append)

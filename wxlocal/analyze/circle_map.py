@@ -12,23 +12,48 @@ circle_meta.json 格式(可选, 由LLM分析后回写):
 """
 import argparse, json, math
 from collections import Counter, defaultdict
-import networkx as nx
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.lines as mlines
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import connect, GRP
 
-# Windows 中文字体回退链
-for f in ('Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei', 'sans-serif'):
+
+def require_deps():
+    """延迟导入可选的绘图依赖 → ``(networkx, pyplot, matplotlib.lines)``。
+
+    ⚠ 坑（bug #5）：原实现在**模块顶层** ``import networkx`` + ``import matplotlib``，但
+    README 只写"circle_map.py 另需 networkx + matplotlib（可选）"。没装时任何调用 ——
+    包括 ``wxflow.py menu`` 的枚举、批量跑、甚至 ``--help`` —— 都在 import 阶段直接崩，
+    且完全不提示"这是可选依赖、装什么"。现改为用到时才导；缺依赖给明确安装指引。
+    """
+    missing = []
     try:
-        matplotlib.rcParams['font.family'] = f
-        break
-    except Exception:
-        continue
-matplotlib.rcParams['axes.unicode_minus'] = False
+        import networkx as nx
+    except ImportError:
+        nx = None
+        missing.append("networkx")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.lines as mlines
+        # Windows 中文字体回退链
+        for fam in ("Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "sans-serif"):
+            try:
+                matplotlib.rcParams["font.family"] = fam
+                break
+            except Exception:
+                continue
+        matplotlib.rcParams["axes.unicode_minus"] = False
+    except ImportError:
+        plt = mlines = None
+        missing.append("matplotlib")
+    if missing:
+        print("✗ 圈层图需要可选的第三方库: " + " + ".join(missing))
+        print("  安装:  pip install " + " ".join(missing))
+        print("  其余分析工具仅依赖标准库；不需要出图的话跳过 circle_map.py 即可。")
+        raise SystemExit(3)
+    return nx, plt, mlines
+
 
 PALETTE = ['#2563eb', '#d97706', '#7c3aed', '#0891b2', '#16a34a', '#9333ea', '#94a3b8',
            '#dc2626', '#0f766e', '#c2410c']
@@ -39,6 +64,7 @@ def main():
     ap.add_argument('--threshold', type=int, default=20)
     ap.add_argument('--out', default=None)
     a = ap.parse_args()
+    nx, plt, mlines = require_deps()        # 放在 parse_args 之后: --help 无需装依赖
     db = connect(a.db)
 
     # LLM 元数据(可选)

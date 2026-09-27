@@ -8,8 +8,11 @@ SQLCipher derives the db key. Verifies each candidate as raw key (PBKDF2->AES pa
 WHY this works: raw key/K1 are protected in memory (AES-NI round keys / wiped after use / secure heap),
 but the HMAC ipad block is the plaintext `key XOR 0x36` at construction time — bypassing all protection.
 
-REQUIREMENTS: pip install frida pycryptodome ; WeChat logged in ; run, then USER restarts WeChat
-(SSH/session-0/schtasks-started WeChat is a hollow shell that never opens dbs — must be desktop-launched).
+REQUIREMENTS: pip install frida pycryptodome ; WeChat logged in ; run, then USER restarts WeChat.
+NOTE: 早期 docstring 断言"SSH/session-0/schtasks 启动的微信是空壳, 不开库, 必须桌面双击" ——
+实测**不成立**: 由**存活的**守护进程 os.startfile 代启动的微信同样会开库并被抓到 key
+(见 wxlocal/key_daemon.py 与 wxlocal/_coldstart_test.py)。人工双击降为兜底。
+Locates the db via config.py (env/registry/drives) —— 不写死盘符与用户名。
 
 Usage: python extract_raw_key.py [seconds]   -> writes key_windows.txt on success.
 """
@@ -26,6 +29,37 @@ import time
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 KEY_FILE = os.path.join(SKILL_DIR, "key_windows.txt")
+
+
+def message0_db_candidates():
+    """``message_0.db`` 的候选路径（可迁移：不写死盘符/用户名）。
+
+    优先复用仓库根的 ``config.message_db_globs()``（环境变量 → 注册表 → 各盘 → 主目录）；
+    本文件也被当作"可单独拷走的单元"，故 config 不可用时退化为基于主目录的候选。
+    显式指定用 ``WX_ACCOUNT``（哪个账号）/ ``WX_WECHAT_ROOT``（xwechat_files 在哪）。
+    """
+    pats: list = []
+    try:
+        if SKILL_DIR not in sys.path:
+            sys.path.insert(0, SKILL_DIR)
+        import config as _cfg          # noqa: PLC0415  (可选依赖, 缺了就走退化路径)
+        pats = _cfg.message_db_globs()
+    except Exception:
+        pats = []
+    if not pats:
+        home = os.path.expanduser("~")
+        roots = [os.environ.get("WX_WECHAT_ROOT") or "",
+                 os.path.join(home, "Documents", "xwechat_files"),
+                 os.path.join(home, "xwechat_files")]
+        pats = [os.path.join(r, "*", "db_storage", "message", "message_0.db")
+                for r in roots if r]
+    found: list = []
+    for p in pats:
+        for f in glob.glob(p):
+            if f not in found:
+                found.append(f)
+    return found
+
 
 JS = r"""
 function scanRanges(m, protection, pattern) {
@@ -239,10 +273,22 @@ def main(argv=None):
         import frida
         from Crypto.Cipher import AES  # Check dependencies before closing WeChat.
 
-        dbs = glob.glob(r"C:\Users\*\Documents\xwechat_files\*\db_storage\message\message_0.db")
+        dbs = message0_db_candidates()
         if not dbs:
-            raise FileNotFoundError("message_0.db not found")
-        with open(dbs[0], "rb") as source:
+            raise FileNotFoundError(
+                "message_0.db not found; 设 WX_WECHAT_ROOT / WX_ACCOUNT 显式指定 "
+                "(或确认微信已登录过本机)")
+        # 多账号时选**最近活跃**的那个（你刚重启登录的账号其库最新）。
+        # 但若用 WX_ACCOUNT 显式指定，则保持 config 的顺序（指定账号已排首位），不排序。
+        if not os.environ.get("WX_ACCOUNT"):
+            dbs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        chosen = dbs[0]
+        _acct = os.path.basename(os.path.dirname(os.path.dirname(chosen)))
+        if len(dbs) > 1:
+            print(f"[extract] 发现 {len(dbs)} 个账号的 message_0.db, 选用 {_acct}"
+                  f" (其余: {', '.join(os.path.basename(os.path.dirname(os.path.dirname(d))) for d in dbs[1:])})")
+            print("[extract] 要换账号: set WX_ACCOUNT=<账号目录名> 后重跑")
+        with open(chosen, "rb") as source:
             page1 = source.read(4096)
         if len(page1) != 4096:
             raise ValueError("message_0.db has an incomplete first page")

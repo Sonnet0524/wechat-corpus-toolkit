@@ -36,6 +36,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PY = sys.executable
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)          # 让 wxlocal/ 下的脚本能 import 仓库根的 config
+import config as wconfig             # noqa: E402  (补好 sys.path 再导; 提供运行时定位)
 
 KEY_FILE = os.path.join(ROOT, "key_windows.txt")
 DECRYPTED_DIR = os.path.join(ROOT, "decrypted")
@@ -46,16 +49,46 @@ KEY_DAEMON = os.path.join(HERE, "key_daemon.py")
 KEY_EVENT = os.path.join(HERE, ".key_event.json")
 
 
+# ────────────────────────── 定位层(可迁移) ──────────────────────────
+
+_WEIXIN_CACHE: dict = {}
+
+
+def weixin_exe():
+    """微信主程序 ``(path | None, tried)``。运行时探测, 不写死盘符/安装目录。
+
+    曾经这里写死 ``C:\\Program Files\\Tencent\\Weixin\\Weixin.exe`` —— 装在别的盘
+    或自定义目录就找不到。现走 ``config.find_weixin_exe()``（环境变量 → 注册表
+    InstallPath → 各盘常见目录 → PATH → 限深兜底搜索）。也可用 ``WX_WEIXIN`` 指定。
+    """
+    if "v" not in _WEIXIN_CACHE:
+        _WEIXIN_CACHE["v"] = wconfig.find_weixin_exe()
+    return _WEIXIN_CACHE["v"]
+
+
+def _weixin_hint(tried) -> str:
+    head = "；".join(str(t) for t in tried[:4]) if tried else "（无候选）"
+    return (f"试过: {head} …\n"
+            f"      请显式指定后重试:  set {wconfig.ENV_WEIXIN}=D:\\路径\\Weixin.exe")
+
+
+def _fmt_ms(ms: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ms / 1000)) if ms else "-"
+
+
 # ────────────────────────── 检测层 ──────────────────────────
 
 def find_source_db_storage():
-    """返回 (src_root, account) 或 (None, None)。src_root=最新的加密库目录"""
-    roots = glob.glob(os.path.expanduser(r"~/Documents/xwechat_files/*/db_storage"))
-    if not roots:
+    """返回 ``(src_root, account)`` 或 ``(None, None)``。src_root=选定账号的加密库目录。
+
+    可迁移 + 多账号: 账号由 ``config`` 运行时枚举（不假定盘符/用户名/安装位置）；
+    多账号时按 ``WX_ACCOUNT`` 指定，否则取**最近活跃**的那一个（微信运行中持续写它的库）。
+    完整账号清单见 ``diagnose()`` 的第 0 行输出。
+    """
+    acc, _why = wconfig.choose_account()
+    if not acc:
         return None, None
-    src = max(roots, key=os.path.getmtime)
-    account = os.path.basename(os.path.dirname(src))
-    return src, account
+    return acc["db_storage"], acc["account"]
 
 
 def read_key():
@@ -113,12 +146,25 @@ def mirror_state(src_root: str, account: str) -> str:
 def diagnose():
     """返回 [(step, state, detail)] 状态表"""
     rows = []
-    src_root, account = find_source_db_storage()
+    accounts = wconfig.list_accounts()
+    acct, why = wconfig.choose_account(accounts)
     key = read_key()
-    if src_root is None:
-        rows.append((1, "block", "未找到 ~/Documents/xwechat_files/*/db_storage (微信未登录过?)"))
+    if not acct:
+        roots = wconfig.data_roots()
+        rows.append((1, "block",
+                     "未发现任何含 db_storage 的账号目录 (微信未登录过?)；已查: "
+                     + ("；".join(roots) if roots
+                        else f"无候选 → 请设 {wconfig.ENV_DATA_ROOT} 指定 xwechat_files 位置")))
         return rows, None, None
-    rows.append((0, "ok", f"加密库: {account} (源 {len(glob.glob(os.path.join(src_root,'**','*.db'), recursive=True))} 个db)"))
+    src_root, account = acct["db_storage"], acct["account"]
+    rows.append((0, "ok", f"加密库: {account} ({acct['n_db']} 个db, {acct['size_mb']}MB, "
+                          f"最新 {_fmt_ms(acct['newest_ms'])}) [{why}]"))
+    others = [x for x in accounts if x["account"] != account]
+    if others:
+        rows.append((0, "todo",
+                     f"另发现 {len(others)} 个登录过的账号: "
+                     + ", ".join(f"{x['account']}({_fmt_ms(x['newest_ms'])})" for x in others)
+                     + f" → 要处理指定的那个请设 {wconfig.ENV_ACCOUNT}=<账号>"))
     if not key:
         rows.append((1, "todo", "key_windows.txt 缺失 → 需提key"))
     elif verify_key(key, src_root):
@@ -159,9 +205,6 @@ def run_stream(cmd: list, cwd=ROOT):
     return p.returncode
 
 
-WEIXIN_EXE = r"C:\Program Files\Tencent\Weixin\Weixin.exe"
-
-
 def weixin_pids() -> list:
     """存活的 Weixin.exe [(pid, mem_kib)]"""
     r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
@@ -185,11 +228,14 @@ def relaunch_weixin_if_dead() -> bool:
     """
     if weixin_pids():
         return True                      # 还活着, 无需干预
-    if not os.path.exists(WEIXIN_EXE):
-        return False                     # 找不到微信, 交给提示
+    wx, tried = weixin_exe()
+    if not wx:
+        print("  ✗ 未定位到微信主程序（运行时探测，不写死盘符/安装目录）")
+        print("    " + _weixin_hint(tried))
+        return False
     time.sleep(15)                       # 等单实例锁完全释放(实测8s可能不够)
     try:
-        os.startfile(WEIXIN_EXE)         # ShellExecute, 由壳进程代启
+        os.startfile(wx)                 # ShellExecute, 由壳进程代启
     except OSError:
         return False
     # 首次尝试失败(锁/竞态)再试一次, 间隔 20s
@@ -202,7 +248,7 @@ def relaunch_weixin_if_dead() -> bool:
             print("  ⚠ 首次启动未确认存活, 20s 后重试...")
             time.sleep(20)
             try:
-                os.startfile(WEIXIN_EXE)
+                os.startfile(wx)
             except OSError:
                 return False
     return any(p > 0 for p, _m in weixin_pids())
@@ -218,7 +264,8 @@ def daemon_status() -> dict:
         return {}
 
 
-def step_extract_key(auto: bool, legacy: bool = False, src_root: str = None) -> bool:
+def step_extract_key(auto: bool, legacy: bool = False, src_root: str = None,
+                     account: str = None) -> bool:
     """① 提 key。默认走 key_daemon.py(脱离式守望), --legacy-extract 走 v6.3 老路。
 
     为什么默认换成守护: extractor 必须 taskkill 微信再等桌面重启, 若它跑在命令的
@@ -236,6 +283,9 @@ def step_extract_key(auto: bool, legacy: bool = False, src_root: str = None) -> 
     print("       (SSH/服务方式启动的微信是空壳, 不会打开数据库)")
     print("    3) 拿到 key 后守望写 wxlocal/.key_event.json 并弹窗, 必要时自动保活")
     print("    4) 守望脱离运行: 本命令退出不影响它")
+    if account:
+        print(f"  ⚠ 本机该账号目录是 {account} —— 重启后请确认登录的是**同一个账号**,")
+        print(f"     否则提 key 校验会失败(盐值取自 {account} 的 message_0.db)。")
     if not confirm("现在开始(会关闭微信)?", auto):
         print("  → 跳过。key 未更新, 后续解密可能失败。")
         return False
@@ -373,13 +423,17 @@ def main():
         print("\n(--check 只诊断模式, 未做任何改动)")
         return 0
     if src_root is None:
-        print("\n✗ 阻断: 找不到加密库。请先登录微信桌面版再回来。")
+        print("\n✗ 阻断: 找不到加密库(未发现含 db_storage 的账号目录)。")
+        print("  若微信装在别处/存储位置已改: 用环境变量显式指定后再来 ——")
+        print(f"    set {wconfig.ENV_DATA_ROOT}=D:\\path\\xwechat_files")
+        print("  若从未在本机登录过微信桌面版: 请先登录再回来。")
         return 1
 
     # 决策: 缺哪补哪
     states = {r[0]: r[1] for r in rows}
     if a.until >= 1 and states.get(1) == "todo":
-        if not step_extract_key(auto, legacy=a.legacy_extract, src_root=src_root):
+        if not step_extract_key(auto, legacy=a.legacy_extract, src_root=src_root,
+                                account=account):
             return 1
         states = {r[0]: r[1] for r in diagnose()[0]}   # 重新诊断
         if states.get(1) != "ok":

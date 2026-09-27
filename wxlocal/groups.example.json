@@ -1,0 +1,32 @@
+[
+  {
+    "slug": "wx_demo_group_a",
+    "kw": "12345678@chatroom",
+    "wxid": "12345678@chatroom",
+    "kind": "group",
+    "name": "示例群A",
+    "named": true,
+    "n_members": 0,
+    "last_active": "2026-01-01 00:00",
+    "days_ago": 0.0,
+    "exported": false,
+    "n_msgs": 0,
+    "empty": false,
+    "on": true
+  },
+  {
+    "slug": "wx_demo_group_b",
+    "kw": "23456789@chatroom",
+    "wxid": "23456789@chatroom",
+    "kind": "group",
+    "name": "示例群B",
+    "named": true,
+    "n_members": 0,
+    "last_active": "2026-01-01 00:00",
+    "days_ago": 0.0,
+    "exported": false,
+    "n_msgs": 0,
+    "empty": false,
+    "on": false
+  }
+]

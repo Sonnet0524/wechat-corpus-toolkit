@@ -30,7 +30,7 @@ agent_created: true
 | Python | `.venv/Scripts/python.exe`（Windows 控制台**必须**加 `PYTHONUTF8=1` 前缀） |
 | 平台 | Windows（提 key/解密均为 Windows 路径；macOS 走 `scripts/macos/`） |
 | 依赖 | `frida`、`pycryptodome`（见 `code/requirements-windows.txt`） |
-| 源库位置 | `~/Documents/xwechat_files/<account>/db_storage`（account = `{wxid}_{device}`） |
+| 源库位置 | **运行时探测**（见下）—— `xwechat_files/<account>/db_storage`，account = `{wxid}_{device}` |
 | 产物 | `decrypted/`（明文镜像）、`wxlocal/exports21/`（导出）、`wxlocal/wxbase.db`（库） |
 
 ```bash
@@ -40,13 +40,33 @@ PYTHONUTF8=1 .venv/Scripts/python.exe <脚本>
 
 > 若用 skill 自带的 `code/` 副本运行，把 `cd` 换成 `code/` 目录，命令其余不变。
 
+### 1.1 位置全部运行时探测（不写死盘符 / 用户名 / 安装目录）
+
+`config.py` 是唯一定位口，**不假定 C 盘、不假定 `C:\Users\<名>`**。所有脚本都走它
+（`config.find_weixin_exe()` / `list_accounts()` / `choose_account()` / `data_globs()` /
+`account_data_roots()` / `message_db_globs()`）。
+
+| 要找什么 | 探测顺序 | 显式覆盖 |
+|---|---|---|
+| 微信主程序 | 环境变量 → 注册表（HKCU/HKLM `Software\Tencent\Weixin` 的 `InstallPath`、`App Paths`、Uninstall 项）→ 各盘 × 常见程序目录 → `PATH` → **限深兜底搜索**（只到 3 层，跳过系统/用户目录） | `set WX_WEIXIN=D:\路径\Weixin.exe` |
+| `xwechat_files` 根 | 环境变量 → `~/Documents` → `~` → 每个盘的根与其 `Documents` | `set WX_WECHAT_ROOT=D:\路径\xwechat_files` |
+| 哪个账号 | 列 `xwechat_files/*`，**含 `db_storage` 的才算账号**（自动排除 `All Users`/`Backup`/`Finderlive`） | `set WX_ACCOUNT=<账号目录名>` |
+
+- **多账号**：本机登录过的账号会全部列出；默认取**最近活跃**的那个（微信运行中持续写它的库）。
+  要分析指定的那个 → `WX_ACCOUNT`。`bootstrap.py --check` 与 `doctor.py` 会直接把账号清单打出来。
+- **提 key 前务必确认重启后登录的是同一个账号** —— 页头校验的盐值取自该账号的 `message_0.db`。
+- 探测只读、**只用标准库**（`winreg`/`ctypes`/`glob`），**不调** `reg.exe`/`wmic`/`powershell`
+  （可能被安全策略拦，且各有编码坑）。权限不足的目录**跳过而非报错**；真要读受限目录时，
+  用上面的环境变量显式指定，或提权跑一次。
+- 探测失败**只降级**（返回候选清单 + 提示怎么指定），绝不抛异常打断流程。
+
 ---
 
 ## 2. 六阶段总览
 
 | 阶段 | 脚本 | 输入 | 输出 | 可全自动 |
 |---|---|---|---|---|
-| 0 定位加密库 | — | `~/Documents/xwechat_files/*/db_storage` | — | ✓ |
+| 0 定位加密库 | `config.py`（运行时探测） | 环境变量 / 注册表 / 各盘 | 选定账号（多账号时取最近活跃） | ✓ |
 | ① 提 key | `scripts/windows/extract_raw_key.py`（+ `wxlocal/key_daemon.py`） | 运行中的微信 | `key_windows.txt`（64 位 hex） | ✗ 需桌面重启微信 |
 | ② 解密 | `scripts/windows/decrypt_all.py` | 加密库 + key | `decrypted/<account>/db_storage/**.db` | ✓ |
 | ③ 验证 | `scripts/common/doctor.py` | 明文镜像 | 诊断 JSON | ✓ |
@@ -118,8 +138,22 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/key_daemon.py start      # 推荐:
 PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/key_daemon.py watch --no-extract --timeout 60  # 前台自用
 ```
 
-- 守望用 **Windows 计划任务**（`/SC ONCE /SD <远期日期> /Run`）拉起 → 天然脱离父命令的
-  **作业对象(Job Object)**；否则命令一退出，子进程与它启动的微信会被一起回收（「起后即死」）。
+- 守望用 **Windows 计划任务**拉起 → 天然脱离父命令的 **作业对象(Job Object)**；否则命令一退出，
+  子进程与它启动的微信会被一起回收（「起后即死」）。
+  任务本身是**一次性**的（远期触发 + 立即 `/Run`，收尾删除），不留日历残留。
+- 建任务优先走 **XML**（`schtasks /Create /TN <t> /XML <f> /F`），不是命令行 `/TR ... /SD`——
+  这是两个**真 bug** 逼出来的（作者机器「英文区域 + 台式机」，两个都不暴露；换「中文笔记本」立刻现形）：
+
+  | # | 坑 | 现象 | 修法 |
+  |---|---|---|---|
+  | 1 | `/SD` **只认本机短日期格式**，原写死美式 `12/31/2099` | 中文(zh-CN) 短日期是 `yyyy/M/d` → schtasks **拒绝该日期**，`/Create` 失败 → **守望根本没建起来** | XML 用 ISO `StartBoundary`（与区域无关）；回退路径改为查 `LOCALE_SSHORTDATE` **现场拼** |
+  | 2 | 命令行**没有**电池开关，schtasks 默认 `DisallowStartIfOnBatteries=true`、`StopIfGoingOnBatteries=true` | 笔记本上若电源被判定为「用电池」，任务**静默不执行**；而从建到跑**全部报成功** → 现象只有「守望像没起来」 | XML 里显式置 `false`，并在建完后**回读校验**（`sched_battery_disallowed`），`selftest` 也回读该字段 |
+  | 3 | `.cmd` 用 `encoding="ascii", errors="replace"` 写 | 工作副本路径含**中文**（如 `D:\示例中文目录\…`）时，路径被写成 `?`；计划任务按 ANSI(GBK) 代码页执行 → 找不到脚本/marker → `rc=1` | ①按 **ANSI 代码页(mbcs)** 写字节；②正文用 `%~dp0` 引用同目录文件、**不内嵌仓库路径**；③`/TR` 与解释器路径取 **8.3 短路径**（ASCII） |
+  | 4 | `build_db21.py` **没有 argparse**，用 `"--rebuild" in sys.argv` 解析 | `--help`/任何拼错的参数都被当「正常运行」→ **直接清空六张表重灌** | 改标准 argparse（`--rebuild`/`--append` 互斥）；`--help` 与未知参数**不动库** |
+  | 5 | `network3.py`/`circle_map.py` 在**模块顶层** `import networkx`（circle_map 还有 matplotlib），而 README 说它是**可选** | 没装时任何调用——含 `wxflow.py menu` 枚举与 `--help`——都在 import 阶段直接崩，且不提示是可选依赖 | 改 `require_networkx()` / `require_deps()` **延迟导入**（放在 `parse_args` 之后），缺依赖给安装指引并 `rc=3` |
+
+  自检：`key_daemon.py selftest` 会回读 `battery_restricted` 与 `far_date`，
+  失败时给出「①电池限制 ②安全软件 ③.cmd 编码」三条排查线索。
 - 事件落 `wxlocal/.key_event.json`（`watch_started` / `key_acquired` / `timeout`），全程日志 `wxlocal/.key_daemon.log`。
 - 环境边界：agent 会话里 `schtasks.exe` 常被安全策略拦截（`WinError 5`，不可绕行）→ `start`
   会降级提示，请到**你自己的终端**跑 `watch`；`bootstrap.py --legacy-extract` 是 v6.3 直连兜底。
@@ -242,6 +276,9 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/build_db21.py --append    # 保留
 ```
 
 - **默认幂等**：先清空六张数据表再重灌（否则重复运行**翻倍** —— 重建两次核对总数须一致）。
+- ⚠ **参数解析走 argparse**（坑 #4）：以前用 `"--rebuild" in sys.argv`，于是 `--help` 或任何
+  拼错的参数都被当成「正常运行」→ **直接清空六张表重灌**。现在 `--help`/`-h` 只打帮助（`rc=0`）、
+  未知参数报错退出（`rc=2`），两者都**不动库**。`--rebuild` 与 `--append` 互斥。
 - `migrate()` 对既有库自动 `ALTER TABLE` 补 `chat_type` 列（`IF NOT EXISTS` 不会自动加列）。
 - **身份归并三层**：
   1. `identities.json` 的 `me` 列表（**首位 = 主号**，与 `export21._me_wxids` 约定一致）：
@@ -298,7 +335,9 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py rooms --type AI --recent
 
 1. **key 有效性 = 对 `message_0.db` 第一页实测**（PBKDF2→AES→页头），**不是**「文件存在」。
 2. 提 key 后判成功看 `extractor rc==0` + 实测；**不要**看「key 指纹是否变化」（重提逐字节一致）。
-3. 提 key 的 90s 窗口内必须**桌面双击**重启微信；SSH/schtasks 启动的微信不开库。
+3. 提 key 的 90s 窗口内必须有微信重启。桌面双击是**兜底**；实测（2026-09-26 冷启动复测，`_coldstart_test.py`）
+   由**存活的**守望进程 `os.startfile` 代启动的微信**同样开库**并能抓到 key —— `extractor` 旧 docstring
+   里「非桌面双击=空壳」的断言**已证伪**。
 4. extractor/守望**不能跑在会退出的父进程里**（作业对象回收）→ 用 `key_daemon.py` 计划任务脱离。
 5. 杀微信后**不要立即**代启动（撞单实例锁）；等 ~8–15s，或由守望处理。
 6. 解密**只读源库**；产物目录 `0700`、文件 `0600`，写盘原子（mkstemp + os.replace）。
@@ -311,6 +350,16 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py rooms --type AI --recent
 13. 池条目 `kw` **一律 wxid**。
 14. **窗内 0 条照记**（`empty: true`），不跳过。
 15. 发送者链**分库解析**（msg0/msg1 的 Name2Id 编号各自独立，`real_sender_id` ≠ `contact.id`）。
+16. **计划任务一律用 XML 建**（`/Create /XML`）：`StartBoundary` 用 ISO（区域无关），
+    `DisallowStartIfOnBatteries=false`。命令行 `/SD` **只认本机短日期格式**，且**没有**电池开关。
+17. **写 `.cmd` 必须按系统 ANSI 代码页（`mbcs`）**，且正文用 `%~dp0` 引用同目录文件、
+    **不得内嵌仓库路径**；`/TR` 与解释器路径取 8.3 短路径。仓库路径含中文即触发（见 §3① 坑 3）。
+18. **任何 CLI 脚本都要有 argparse**。`"--flag" in sys.argv` 式解析会让 `--help`/拼错参数变成
+    **真跑**（`build_db21.py` 曾因此 `--help` 直接清库重灌）。
+19. **可选的第三方依赖一律延迟导入**（放 `parse_args` 之后）。模块顶层 `import networkx` 会让
+    `wxflow.py menu` 枚举、甚至 `--help` 一起崩；README 写"可选"就必须真可选。
+20. **一切位置靠运行时探测**（`config.py`）；不得写死盘符/安装目录/用户名/`~/Documents`。
+    需要指定时用 `WX_WEIXIN` / `WX_WECHAT_ROOT` / `WX_ACCOUNT`，**不要改代码**。
 16. `local_type` 过滤**必须取模** `% 4294967296`。
 17. 建库**默认清空重灌**（幂等）；`--append` 仅特殊场景。
 18. `me` 的 wxid **恒取 `identities.json` 首位**（主号），勿用 `sorted()`。
@@ -388,12 +437,18 @@ PYTHONUTF8=1 .venv/Scripts/python.exe wxlocal/wxflow.py rooms --type AI --recent
 code/                                    ← 等价于仓库根
 ├── config.py db.py contacts.py message.py appmsg.py crypto.py   # 核心库
 ├── requirements-windows.txt  README.md  _sync_from_repo.sh
-├── scripts/common/{query,crypto_backend,doctor,verify_key}.py
+├── scripts/common/{query,crypto_backend,doctor,verify_key,
+│                 export_media,read_doc}.py
 ├── scripts/windows/{extract_raw_key,decrypt_all,decrypt_read}.py
 └── wxlocal/{export21,run_batch21,merge_exports,build_db21,
             wxflow,select_groups,bootstrap,key_daemon}.py
     wxlocal/identities.example.json
+    wxlocal/groups.example.json  dms.example.json   # 清单样例（纯占位）
 ```
+
+> **分析层（⑥）不在本目录**：它在 skill `wechat-corpus-pipeline` 的 `code/wxlocal/analyze/`。
+> 分析脚本把库路径硬编码为 `<analyze>/../wxbase.db`，所以跑分析前要把两半并成**同一棵 `wxlocal/`**
+> —— 命令见包顶层 `README.md`「把两半拼成一棵树」。
 
 **独立运行**（换机器）：
 
@@ -408,7 +463,8 @@ python wxlocal/bootstrap.py --check
 **与仓库的差异**（有意为之，见 `code/README.md`）：
 
 1. `run_batch21.py` 的 `PY`：硬编码 `ROOT/.venv/...` → 三级回退 `WX_PY` → `.venv` → 当前解释器；
-2. `identities.json` → `identities.example.json`（避免个人账号随 skill 外发）。
+2. `identities.json` → `identities.example.json`（避免个人账号随 skill 外发）；
+3. 清单样例 `groups.example.json` / `dms.example.json` 为**纯占位**（真实清单由 `wxflow.py sync-groups` / `sync-dms` 生成，属个人数据不随包）。
 
 **同步**：仓库改了代码后 `bash code/_sync_from_repo.sh`（自动重打补丁）。
 
